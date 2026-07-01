@@ -785,10 +785,6 @@ components:
           type: string
           format: date-time
           description: Server-side timestamp when this view was assembled.
-        # Map keyed by region name (`fra`, `us-east1`, etc.) — preferred
-        # over an array because the wire shape is unordered today and
-        # the Go handler encodes it as `map[string]RegionView`. Operators
-        # consuming this endpoint should iterate `Object.keys()`.
         regions:
           type: object
           additionalProperties:
@@ -803,11 +799,7 @@ components:
             $ref: '#/components/schemas/WorkerStatus'
         apps_per_worker_avg:
           type: integer
-          description: |
-            Mean number of apps hosted per worker in this region, rounded
-            down to the nearest integer. Useful to spot fleet skew
-            (one worker pinned at 100 apps while peers sit at 5).
-            Set to 0 when the region has no workers yet.
+          description: Mean number of apps hosted per worker in this region.
 
     WorkerStatus:
       type: object
@@ -820,8 +812,7 @@ components:
           example: us-east1
         ip:
           type: string
-          description: Worker public IP. Omitted when the worker has not reported one yet.
-          example: 203.0.113.42
+          description: Worker public IP. Omitted when not reported.
         last_seen:
           type: string
           format: date-time
@@ -835,12 +826,9 @@ components:
           description: Worker-allocated memory budget.
           example: 4096
 
-    # -------------------------------------------------------------------------
-    # Autoscale events (issue #85)
-    # -------------------------------------------------------------------------
     AutoscaleEvent:
       type: object
-      description: One row in the `autoscale_events` table — a single decision tick.
+      description: One row in the autoscale_events table.
       properties:
         id:
           type: integer
@@ -856,13 +844,10 @@ components:
           enum: [scale_up, scale_down, noop]
         from_count:
           type: integer
-          description: Fleet size before the action.
         to_count:
           type: integer
-          description: Fleet size the autoscaler targeted.
         reason:
           type: string
-          description: Machine-readable explanation (e.g., "free_slots=0 needed=5").
         provider_kind:
           type: string
           example: noop
@@ -871,11 +856,10 @@ components:
         error_message:
           type: string
           nullable: true
-          description: Cloud-provider error text when `succeeded=false`; null otherwise.
 
     AutoscaleEventList:
       type: object
-      description: Envelope returned by `GET /api/v1/admin/cluster/events`.
+      description: Envelope returned by GET /api/v1/admin/cluster/events.
       properties:
         items:
           type: array
@@ -883,11 +867,10 @@ components:
             $ref: '#/components/schemas/AutoscaleEvent'
         limit:
           type: integer
-          description: The limit that was applied server-side.
         region:
           type: string
           nullable: true
-          description: The region filter (echoed back). Null when listing all regions.
+          example: 9821
 
     # -------------------------------------------------------------------------
     # Custom domains (issue #83)
@@ -2212,10 +2195,7 @@ paths:
       operationId: listAutoscaleEvents
       summary: List recent cluster autoscaler events (admin only)
       description: |
-        Returns the most-recent `autoscale_events` rows, newest first.
-        Operators use this to answer "why did the fleet size change?".
-        Both the cluster handler and the `edge cluster events` CLI consume
-        this endpoint.
+        Returns the most-recent autoscale_events rows, newest first.
       security:
         - ApiKeyAuth: []
       parameters:
@@ -2224,7 +2204,7 @@ paths:
           required: false
           schema:
             type: string
-          description: Restrict to a single region (e.g., `fra`). Omit for all regions.
+          description: Restrict to a single region. Omit for all regions.
         - in: query
           name: limit
           required: false

@@ -111,9 +111,10 @@ func isInfrastructure(route string) bool {
 	return hasPrefix && notVersioned
 }
 
-// parseRoutes extracts all mux.HandleFunc("METHOD /path", ...) from the given files.
+// parseRoutes extracts all mux.HandleFunc("METHOD /path", ...) and
+// mux.Handle("METHOD /path", ...) calls from the given files.
 func parseRoutes(filenames ...string) ([]route, error) {
-	pattern := regexp.MustCompile(`\.HandleFunc\s*\(\s*"([A-Z]+)\s+([^"]+)"`)
+	pattern := regexp.MustCompile(`\.Handle(?:Func)?\s*\(\s*"([A-Z]+)\s+([^"]+)"`)
 
 	var routes []route
 	seen := make(map[string]bool)
