@@ -3,7 +3,6 @@ package service
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -81,7 +80,12 @@ func IsValidRegion(r string) bool {
 }
 
 // MaxArtifactSize is the maximum allowed artifact size in bytes (100 MiB).
-const MaxArtifactSize = 100 * 1024 * 1024
+//
+// The canonical constant lives in internal/storage so the read-side cap
+// (used by ArtifactStore.Open) and the upload-side cap (used by the
+// migration handler) stay colocated. This alias preserves the existing
+// in-package reference for upload-side callers.
+const MaxArtifactSize = storage.MaxArtifactSize
 
 // MaxRegionsPerDeployment caps the number of regions a single deployment
 // can target. Defensive ceiling against fan-out abuse; realistic tenants
@@ -99,6 +103,12 @@ var (
 	ErrMaxDeploymentsQuotaExceeded = fmt.Errorf("max deployments reached for tenant")
 	ErrInvalidRegion               = errors.New("invalid region")
 	ErrTooManyRegions              = errors.New("too many regions")
+	// ErrInvalidWasm is returned by Deploy when the artifact's first
+	// 4 bytes aren't the wasm magic (`\0asm`). Streaming keeps us
+	// from validating the full module here, but the magic-byte
+	// check is enough to reject obviously-non-wasm inputs before
+	// the bytes hit disk. Handler maps to HTTP 400.
+	ErrInvalidWasm = errors.New("invalid wasm artifact")
 	ErrNoLastGood                  = fmt.Errorf("no previous deployment to roll back to")
 	// ErrNoActiveDeployment is returned by RollbackDeployment when there
 	// is no active-deployment row for this app (user never activated any
@@ -113,6 +123,12 @@ var (
 	// deployment; the client should treat this as a transient
 	// infrastructure failure. Handler maps to HTTP 502. The wrapped
 	// cause (using Go 1.20+ multi-%w) is preserved for logs.
+	//
+	// On issue #127 step 6, ActivateDeployment / RollbackDeployment
+	// additionally wrap this sentinel inside a *PublishError so the
+	// HTTP layer can surface the exact per-region breakdown via
+	// errors.As. errors.Is(err, ErrPublishFailed) continues to
+	// work — Unwrap() preserves the sentinel match.
 	ErrPublishFailed = fmt.Errorf("publishing task update failed")
 	// ErrAutoRollbackDisabled is returned by RollbackDeployment (via
 	// the repo's ResetStableSinceForRollback SQL guard) when the
@@ -127,6 +143,56 @@ var (
 	ErrAutoRollbackDisabled = errors.New("auto-rollback disabled")
 )
 
+// PublishError carries the per-region outcome of a fan-out
+// publish. Returned by ActivateDeployment / RollbackDeployment
+// when at least one region's NATS publish failed; the wrapped
+// Err is always ErrPublishFailed so existing
+// errors.Is(err, ErrPublishFailed) checks keep working.
+//
+// The HTTP layer matches via errors.As and writes the
+// regions_published / regions_failed arrays in the 502 body so the
+// operator can see exactly which regions got the message and which
+// are still pending retry. See handler/deployment.go for the
+// envelope shape.
+//
+// Published is the deduped set of regions whose publish succeeded
+// on THIS activation attempt (NOT the cumulative regions_published
+// column on the active_deployments row — that column is updated by
+// AppendRegionsPublished after the loop). Failed is the regions
+// whose publish failed this attempt; those are merged into
+// regions_failed by AppendRegionsFailed.
+//
+// Zero value is unusable; always construct via `&PublishError{...}`
+// so Unwrap is set.
+type PublishError struct {
+	Published []string
+	Failed    []string
+	Err       error
+}
+
+// Error renders the publish error in a stable human-readable form.
+// Includes the per-region breakdown so log lines are diagnostic
+// without needing to inspect the struct fields.
+func (e *PublishError) Error() string {
+	if e == nil {
+		return "<nil PublishError>"
+	}
+	return fmt.Sprintf("%s (published=%v, failed=%v)",
+		e.Err.Error(), e.Published, e.Failed)
+}
+
+// Unwrap returns the wrapped sentinel so errors.Is(err, ErrPublishFailed)
+// keeps matching. This is the contract that handler/deployment.go
+// (and the pre-step-6 string-error path) relies on — both the
+// wrapped sentinel AND the typed error must be reachable from the
+// returned value.
+func (e *PublishError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 // DeploymentService handles deployment business logic.
 type DeploymentService struct {
 	db             *sqlx.DB
@@ -135,7 +201,7 @@ type DeploymentService struct {
 	appEnvRepo     *repository.AppEnvRepository
 	quotaRepo      *repository.QuotaRepository
 	tenantRepo     *repository.TenantRepository
-	artifactStore  *storage.ArtifactStore
+	artifactStore  storage.ArtifactStore
 	publisher      nats.Publisher
 	appSvc         *AppService
 	// defaultRegion is this control plane's own region. Used as the
@@ -155,7 +221,7 @@ func NewDeploymentService(
 	appEnvRepo *repository.AppEnvRepository,
 	quotaRepo *repository.QuotaRepository,
 	tenantRepo *repository.TenantRepository,
-	artifactStore *storage.ArtifactStore,
+	artifactStore storage.ArtifactStore,
 	publisher nats.Publisher,
 	defaultRegion string,
 ) *DeploymentService {
@@ -244,24 +310,14 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		return nil, ErrMaxDeploymentsQuotaExceeded
 	}
 
-	// Read artifact and compute hash (bounded to prevent memory exhaustion)
-	data, err := io.ReadAll(io.LimitReader(r, MaxArtifactSize+1))
-	if err != nil {
-		return nil, fmt.Errorf("reading artifact: %w", err)
-	}
-	if int64(len(data)) > MaxArtifactSize {
-		return nil, fmt.Errorf("artifact exceeds maximum size of %d bytes", MaxArtifactSize)
-	}
-
-	// Reject non-wasm artifacts before persisting them. Without this guard a
-	// non-wasm file would be stored, hashed, and shipped to workers, where
-	// it would fail only at execution time. Magic bytes are the cheapest
-	// first-line check — full module validation is wasmtime's job.
-	if !validateWasm(data) {
-		return nil, fmt.Errorf("invalid wasm artifact: missing magic bytes (\\0asm)")
-	}
-
-	hash := sha256.Sum256(data)
+	// Note: we no longer buffer the entire artifact in memory here.
+	// The streaming SaveAndHash below does hash + write in a single
+	// pass; the only bytes we touch up front are the 4-byte wasm
+	// magic (peeked inside the tx callback at line ~311) so we can
+	// reject non-wasm blobs cheaply before any disk I/O happens.
+	// The handler enforces the MaxArtifactSize cap via
+	// http.MaxBytesReader, so the inner read never sees more than
+	// MaxArtifactSize bytes.
 
 	// Resolve the effective regions list: explicit > default. We
 	// keep the empty `regions` slice distinct from nil so the repo
@@ -278,8 +334,11 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		TenantID:  tenantID,
 		AppName:   appName,
 		Status:    domain.StatusDeployed,
-		Hash:      hex.EncodeToString(hash[:]),
-		Regions:   domain.StringArrayFrom(effectiveRegions),
+		// Hash is populated after SaveAndHash returns the SHA-256
+		// of the streamed bytes. Streaming keeps the bytes from
+		// ever sitting in RAM as a single buffer.
+		Hash:    "",
+		Regions: domain.StringArrayFrom(effectiveRegions),
 		CreatedAt: time.Now(),
 		// Persist the tenant opt-in on the artifact row so audit
 		// endpoints (`edge deployments --app foo`) can show which
@@ -288,13 +347,94 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		AutoRollbackEnabled: autoRollback,
 	}
 
-	if err := s.deploymentRepo.Create(ctx, deployment); err != nil {
-		return nil, fmt.Errorf("creating deployment: %w", err)
+// Wrap the row insert and the artifact save in a transaction
+	// so a failed SaveAndHash rolls the deployment row back
+	// atomically (we don't end up with a row pointing at no
+	// artifact). The artifact store is filesystem, so the tx only
+	// protects the row; if SaveAndHash succeeds and the tx commit
+	// fails, the blob is left on disk but no row references it
+	// (operator-cleanable). SaveAndHash is atomic on disk via the
+	// temp-rename pattern, so a failed write never leaves partial
+	// bytes at the final path.
+	//
+	// The 4-byte wasm magic peek runs INSIDE the tx callback so
+	// a non-wasm artifact is rejected before any disk I/O. The
+	// remaining stream is then handed to SaveAndHash, which hashes
+	// and writes in a single pass.
+	//
+	// When s.db is nil (the test path, where a sqlmock or
+	// in-memory harness wires repos but not a *sqlx.DB), fall
+	// back to the no-tx path so the call doesn't segfault on
+	// `db.BeginTxx(nil)`. Production callers always have s.db.
+	if s.db != nil {
+		err = repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
+			magic := make([]byte, 4)
+			if _, err := io.ReadFull(r, magic); err != nil {
+				return fmt.Errorf("reading wasm magic: %w", err)
+			}
+			if !bytes.Equal(magic, []byte{0x00, 0x61, 0x73, 0x6d}) {
+				return ErrInvalidWasm
+			}
+			hash, saveErr := s.artifactStore.SaveAndHash(ctx, tenantID, appName, deployment.ID, r)
+			if saveErr != nil {
+				return saveErr
+			}
+			deployment.Hash = hex.EncodeToString(hash)
+			if err := s.deploymentRepo.WithTx(tx).Create(ctx, deployment); err != nil {
+				return fmt.Errorf("creating deployment: %w", err)
+			}
+			return nil
+		})
+		// Apps-row cleanup: CreateIfNotExists above inserted the
+		// apps row OUTSIDE the tx (nesting a tx inside another tx
+		// isn't supported by the sqlx layer), so a failed tx only
+		// rolls back the deployment row — not the apps row.
+		// Without this cleanup, a failed first deploy of an app
+		// would orphan the apps row forever, counting against the
+		// tenant's max_apps quota. The NOT EXISTS guard in
+		// DeleteIfNoDeployments makes this safe under concurrent
+		// deploys: if a parallel deploy succeeded for the same
+		// app, NOT EXISTS is FALSE and the apps row stays.
+		if err != nil && s.appSvc != nil {
+			if _, delErr := s.appSvc.DeleteIfNoDeployments(ctx, tenantID, appName); delErr != nil {
+				log.Printf("rollback apps-row cleanup failed after tx failure: tenant_id=%s app_name=%s error=%v", tenantID, appName, delErr)
+			}
+		}
+	} else {
+		// No-tx fallback path (test harnesses that wire repos but
+		// not s.db; production callers always go through the tx
+		// branch above). Use unique names for inner errors so we
+		// don't shadow the outer `err` via the if-init
+		// `err := ...` form.
+		magic := make([]byte, 4)
+		if _, readErr := io.ReadFull(r, magic); readErr != nil {
+			err = fmt.Errorf("reading wasm magic: %w", readErr)
+		} else if !bytes.Equal(magic, []byte{0x00, 0x61, 0x73, 0x6d}) {
+			err = ErrInvalidWasm
+		} else if hash, saveErr := s.artifactStore.SaveAndHash(ctx, tenantID, appName, deployment.ID, r); saveErr != nil {
+			// Compensate in the same order as the tx branch's
+			// equivalent: apps-row cleanup BEFORE deployment-row
+			// cleanup, so the NOT EXISTS guard on
+			// DeleteIfNoDeployments still sees the deployment row
+			// to decide whether to drop the apps row.
+			if s.appSvc != nil {
+				if _, delErr := s.appSvc.DeleteIfNoDeployments(ctx, tenantID, appName); delErr != nil {
+					log.Printf("rollback apps-row cleanup failed after artifact save error: tenant_id=%s app_name=%s error=%v", tenantID, appName, delErr)
+				}
+			}
+			if delErr := s.deploymentRepo.DeleteByID(ctx, deployment.ID); delErr != nil {
+				log.Printf("compensating DeleteByID failed after artifact save error (no-tx path): deployment_id=%s error=%v", deployment.ID, delErr)
+			}
+			err = saveErr
+		} else {
+			deployment.Hash = hex.EncodeToString(hash)
+			if createErr := s.deploymentRepo.Create(ctx, deployment); createErr != nil {
+				err = fmt.Errorf("creating deployment: %w", createErr)
+			}
+		}
 	}
-
-	// Save artifact
-	if err := s.artifactStore.Save(tenantID, appName, deployment.ID, bytes.NewReader(data)); err != nil {
-		return nil, fmt.Errorf("saving artifact: %w", err)
+	if err != nil {
+		return nil, err
 	}
 
 	return deployment, nil
@@ -438,7 +578,7 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 
 	msg := &nats.TaskMessage{
 		Type:      "task_update",
-		Timestamp: time.Now(),
+		Timestamp: time.Now().UTC(),
 		TenantID:  tenantID,
 		Apps: map[string]nats.AppConfig{
 			appName: {
@@ -463,35 +603,148 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 	if len(regions) == 0 {
 		regions = []string{s.defaultRegion}
 	}
-	return s.publishSwap(ctx, msg, regions, deploymentID)
+	return s.publishSwap(ctx, tenantID, appName, deploymentID, msg, regions)
 }
 
-// publishSwap fans a TaskMessage out to every region in `regions`.
-// Used by ActivateDeployment and RollbackDeployment so they cannot
-// drift in their region-fanout behavior (the prior Rollback path
-// published to "global" only, leaving multi-region deployments
-// stuck on the broken version until the next heartbeat).
+// publishSwap fans a TaskMessage out to every region in `regions`,
+// skipping regions that have already been published for this
+// (tenant, app) activation and always retrying regions in
+// regions_failed. Used by ActivateDeployment and RollbackDeployment
+// so they cannot drift in their region-fanout behavior (the prior
+// Rollback path published to "global" only, leaving multi-region
+// deployments stuck on the broken version until the next heartbeat).
+//
+// Idempotency (issue #127 step 6):
+//   - Reads the committed active_deployments row to discover
+//     regions_published (skip — already on the wire) and
+//     regions_failed (always retry — never let a stale
+//     regions_published mask a real failure; see Risk 3 in the
+//     issue #127 plan).
+//   - The publish set is (regions ∪ regions_failed) − regions_published.
+//   - If empty (every region already published), returns nil
+//     without touching the publisher or the DB.
 //
 // Failures in a single region are logged and accumulated into the
-// returned error — we keep publishing to the remaining regions
-// rather than aborting on the first failure, so a transient NATS
-// blip in one region doesn't starve the others. If at least one
-// region fails the error is wrapped with ErrPublishFailed (matched
-// by the HTTP layer for 502); the per-region list is preserved
-// through Go's multi-%w error wrapping so logs can show the full
-// picture. The DB row has already committed by the time we get
-// here, so workers may still be serving the prior deployment; the
-// caller surfaces this as a transient failure to the client.
-func (s *DeploymentService) publishSwap(ctx context.Context, msg *nats.TaskMessage, regions []string, deploymentID string) error {
-	var failedRegions []string
-	for _, region := range regions {
+// returned *PublishError — we keep publishing to the remaining
+// regions rather than aborting on the first failure, so a
+// transient NATS blip in one region doesn't starve the others.
+//
+// On success, persists the per-region outcome via
+// activeRepo.AppendRegionsPublished / AppendRegionsFailed so the
+// next retry call can short-circuit. The append is best-effort:
+// a DB write failure is logged but does not change the returned
+// error — the publish itself already succeeded and the operator
+// would rather see the per-region 502 envelope than a misleading
+// 500.
+//
+// The DB tx has already committed by the time we get here, so
+// workers may still be serving the prior deployment; the caller
+// surfaces this as a transient 502 to the client.
+//
+// Returns nil on full success, or *PublishError{Published, Failed}
+// wrapping ErrPublishFailed on any per-region failure.
+// errors.Is(err, ErrPublishFailed) matches via the *PublishError's
+// Unwrap, preserving the contract the pre-step-6 handler relied on.
+func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, deploymentID string, msg *nats.TaskMessage, regions []string) error {
+	// Read the committed row's publish state. The Set upsert at the
+	// start of Activate / Rollback wipes regions_published and
+	// regions_failed to empty (see ActiveDeploymentRepository.Set's
+	// DO UPDATE clause), so on a first attempt the toPublish set
+	// equals `regions`; on a retry of a partially-failed
+	// activation, prior successes are skipped and prior failures
+	// are included.
+	current, err := s.activeRepo.Get(ctx, tenantID, appName)
+	if err != nil {
+		return fmt.Errorf("reading publish state: %w", err)
+	}
+	alreadyPublished := make(map[string]struct{}, len(current.RegionsPublished))
+	for _, r := range current.RegionsPublished {
+		alreadyPublished[r] = struct{}{}
+	}
+	mustRetry := make(map[string]struct{}, len(current.RegionsFailed))
+	for _, r := range current.RegionsFailed {
+		mustRetry[r] = struct{}{}
+	}
+
+	// toPublish = (regions ∪ regions_failed) − regions_published
+	// Preserves input order for log determinism.
+	seen := make(map[string]struct{}, len(regions))
+	toPublish := make([]string, 0, len(regions)+len(mustRetry))
+	for _, r := range regions {
+		if _, ok := alreadyPublished[r]; ok {
+			continue
+		}
+		if _, dup := seen[r]; dup {
+			continue
+		}
+		seen[r] = struct{}{}
+		toPublish = append(toPublish, r)
+	}
+	for r := range mustRetry {
+		if _, ok := alreadyPublished[r]; ok {
+			continue
+		}
+		if _, dup := seen[r]; dup {
+			continue
+		}
+		seen[r] = struct{}{}
+		toPublish = append(toPublish, r)
+	}
+	if len(toPublish) == 0 {
+		// All requested regions already published. Short-circuit;
+		// do not bump last_publish_at since nothing happened.
+		return nil
+	}
+
+	attemptID := uuid.NewString()
+	now := time.Now()
+	var published []string
+	var failed []string
+	for _, region := range toPublish {
 		if err := s.publisher.PublishTaskUpdate(region, msg); err != nil {
 			log.Printf("publishing task update failed for region %q (deployment %s): %v", region, deploymentID, err)
-			failedRegions = append(failedRegions, region)
+			failed = append(failed, region)
+			continue
+		}
+		published = append(published, region)
+	}
+
+	// Best-effort persistence. Failures here are logged but do
+	// not change the returned error — the publish itself already
+	// happened, and the operator would rather see the structured
+	// 502 envelope than a misleading 500 caused by an audit-log
+	// write failing.
+	//
+	// Both appends share one tx so the row's (regions_published,
+	// regions_failed, last_publish_at, last_publish_attempt_id) stay
+	// consistent even if the process crashes mid-write. Within the
+	// closure, returning the first error aborts the tx and Rollback
+	// discards the first append — the desired atomicity.
+	if len(published) > 0 || len(failed) > 0 {
+		if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
+			txRepo := s.activeRepo.WithTx(tx)
+			if len(published) > 0 {
+				if err := txRepo.AppendRegionsPublished(ctx, tenantID, appName, published, attemptID, now); err != nil {
+					return fmt.Errorf("append regions_published: %w", err)
+				}
+			}
+			if len(failed) > 0 {
+				if err := txRepo.AppendRegionsFailed(ctx, tenantID, appName, failed, attemptID, now); err != nil {
+					return fmt.Errorf("append regions_failed: %w", err)
+				}
+			}
+			return nil
+		}); err != nil {
+			log.Printf("warning: persisting publish state for %s/%s attempt %s: %v", tenantID, appName, attemptID, err)
 		}
 	}
-	if len(failedRegions) > 0 {
-		return fmt.Errorf("%w: %d region(s) failed: %s", ErrPublishFailed, len(failedRegions), strings.Join(failedRegions, ","))
+
+	if len(failed) > 0 {
+		return &PublishError{
+			Published: published,
+			Failed:    failed,
+			Err:       ErrPublishFailed,
+		}
 	}
 	return nil
 }
@@ -611,7 +864,7 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 
 	msg := &nats.TaskMessage{
 		Type:      "task_update",
-		Timestamp: time.Now(),
+		Timestamp: time.Now().UTC(),
 		TenantID:  tenantID,
 		Apps: map[string]nats.AppConfig{
 			appName: {
@@ -623,7 +876,7 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 			},
 		},
 	}
-	if err := s.publishSwap(ctx, msg, regions, rolledBackID); err != nil {
+	if err := s.publishSwap(ctx, tenantID, appName, rolledBackID, msg, regions); err != nil {
 		return "", err
 	}
 
@@ -680,7 +933,7 @@ func (s *DeploymentService) RepublishActiveDeployments(ctx context.Context, tena
 
 		msg := &nats.TaskMessage{
 			Type:      "task_update",
-			Timestamp: time.Now(),
+			Timestamp: time.Now().UTC(),
 			TenantID:  tenantID,
 			Apps: map[string]nats.AppConfig{
 				ad.AppName: {
@@ -728,5 +981,5 @@ func (s *DeploymentService) GetArtifact(ctx context.Context, tenantID, appName, 
 	if deployment.TenantID != tenantID || deployment.AppName != appName {
 		return nil, fmt.Errorf("deployment not found")
 	}
-	return s.artifactStore.Open(tenantID, appName, deploymentID)
+	return s.artifactStore.Open(ctx, tenantID, appName, deploymentID)
 }

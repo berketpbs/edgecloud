@@ -78,6 +78,18 @@ fallback.
   linemarker) keep their expanded line number. For most real-world
   C code this is invisible because the re-entry linemarker for the
   user file is emitted near the top of the expanded source.
+- **Byte-range remap.** Beyond `line_map`, the analyzer maintains a
+  parallel `byte_map` (one entry per expanded line) so pattern
+  byte ranges can be brought back into original-source coordinates
+  before the transformer slices the original source. Without this,
+  byte offsets from the expanded source (which always lead with
+  ~135 bytes of `# <line> "<file>"` linemarkers) overflow the
+  original source's length and panic with "range end index N out
+  of range for slice of length M". When the linear-interpolation
+  remap produces a range that doesn't contain the match's snippet
+  text (typically because clang emitted only one linemarker for
+  the whole file), the analyzer falls back to a content search
+  bounded by 1 KiB.
 - `-nostdinc` means project-internal headers are not auto-included.
   A future `--include-dir` flag will close this gap; tracked as a
   follow-up issue.
@@ -283,8 +295,8 @@ The migration endpoint (`POST /api/migrate`) performs:
 **Tree mode (`POST /api/migrate-tree`, M2):** Accepts a multipart form with one `file` part per source plus a `tree` JSON manifest, OR a single `tree` part with `Content-Type: application/zip`. For each source file:
 
 1. Run `edge-migrate --transform --language <lang> <path>` → WASI source
-2. Run `edge-migrate --analyze --json --language <lang> <path>` → structured `MigrationReport` JSON (used to populate per-file `FileReport.patterns_detected` / `transformations` / `manual_review`)
-3. On `--analyze --json` failure (older binary), fall back to the language-aware string scanner (`detectTransformedPatterns` for C, `detectTransformedPatternsRust` for Rust)
+2. Run `edge-migrate --analyze-json --language <lang> <path>` → structured `MigrationReport` JSON (used to populate per-file `FileReport.patterns_detected` / `transformations` / `manual_review`)
+3. On `--analyze-json` failure (older binary), fall back to the language-aware string scanner (`detectTransformedPatterns` for C, `detectTransformedPatternsRust` for Rust)
 
 The `language` form field gates both the per-file subprocess flag and the final compile step. All transformed files are compiled together in a single invocation (clang for C; a single `rustc` invocation listing every transformed `.rs` file with `--crate-type=cdylib` for Rust). The wasm size is checked against `MaxArtifactSize` (100 MiB); oversized builds return a `Failed` tree report with an error entry. The artifact + deployment row are written only on success.
 
@@ -469,11 +481,11 @@ may still build, but the tree-level status reflects the worst file.
 | `FileReport` field | Source |
 |---|---|
 | `status` | classified from per-file patterns (see §3 status rules) |
-| `patterns_detected`, `transformations`, `manual_review` | parsed from `edge-migrate --analyze --json --language <lang> <path>` subprocess stdout (one subprocess per source file) |
+| `patterns_detected`, `transformations`, `manual_review` | parsed from `edge-migrate --analyze-json --language <lang> <path>` subprocess stdout (one subprocess per source file) |
 | `errors` | per-file parse/transform errors (stderr captured) |
 | `preprocessor` | mirror of the preprocessor's `PreprocessorInfo` for that file (C only — Rust has no preprocessor in v1) |
 
-If `--analyze --json` is unavailable (older `edge-migrate` binary),
+If `--analyze-json` is unavailable (older `edge-migrate` binary),
 the service falls back to a language-aware string scanner
 (`detectTransformedPatterns` for C, `detectTransformedPatternsRust`
 for Rust). This fallback is tracked for removal once the version

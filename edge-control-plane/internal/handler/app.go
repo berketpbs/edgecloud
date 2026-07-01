@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
@@ -13,12 +14,20 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
-// AppHandler handles app HTTP requests.
-type AppHandler struct {
-	appSvc *service.AppService
+// AppServiceInterface is the subset of *service.AppService used by AppHandler.
+type AppServiceInterface interface {
+	Create(ctx context.Context, tenantID, appName string, req *domain.CreateAppRequest) (*domain.App, error)
+	List(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error)
+	Get(ctx context.Context, tenantID, appName string) (*domain.App, error)
+	Delete(ctx context.Context, tenantID, appName string) error
 }
 
-func NewAppHandler(appSvc *service.AppService) *AppHandler {
+// AppHandler handles app HTTP requests.
+type AppHandler struct {
+	appSvc AppServiceInterface
+}
+
+func NewAppHandler(appSvc AppServiceInterface) *AppHandler {
 	return &AppHandler{appSvc: appSvc}
 }
 
@@ -55,7 +64,9 @@ func (h *AppHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(app)
+	if err := json.NewEncoder(w).Encode(app); err != nil {
+		log.Printf("Create app: failed to encode response: %v", err)
+	}
 }
 
 // List handles GET /api/apps — list all apps for the tenant with pagination.
@@ -83,7 +94,9 @@ func (h *AppHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"apps": apps, "limit": limit, "offset": offset})
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{"apps": apps, "limit": limit, "offset": offset}); err != nil {
+		log.Printf("List apps: failed to encode response: %v", err)
+	}
 }
 
 // Get handles GET /api/apps/{appName} — get a specific app.
@@ -108,7 +121,9 @@ func (h *AppHandler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(app)
+	if err := json.NewEncoder(w).Encode(app); err != nil {
+		log.Printf("Get app: failed to encode response: %v", err)
+	}
 }
 
 // Delete handles DELETE /api/apps/{appName} — delete an app and all its data.

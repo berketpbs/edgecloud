@@ -17,6 +17,13 @@ func NewAppRepository(db *sqlx.DB) *AppRepository {
 	return &AppRepository{db: db}
 }
 
+// NewAppRepositoryFromDBTX constructs a repository bound to a DBTX
+// (either *sqlx.DB or *sqlx.Tx). Used by tests that need a tx-bound
+// repo without standing up a full database connection.
+func NewAppRepositoryFromDBTX(dbtx DBTX) *AppRepository {
+	return &AppRepository{db: dbtx}
+}
+
 // WithTx returns a new AppRepository using the provided transaction.
 func (r *AppRepository) WithTx(tx *sqlx.Tx) *AppRepository {
 	return &AppRepository{db: tx}
@@ -31,6 +38,29 @@ func (r *AppRepository) Create(ctx context.Context, app *domain.App) error {
 func (r *AppRepository) Get(ctx context.Context, tenantID, appName string) (*domain.App, error) {
 	var app domain.App
 	query := `SELECT id, tenant_id, name, description, created_at FROM apps WHERE tenant_id = $1 AND name = $2`
+	err := r.db.GetContext(ctx, &app, query, tenantID, appName)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &app, err
+}
+
+// GetForUpdate locks the (tenant_id, name) row with `SELECT … FOR UPDATE`
+// and returns the row. The lock is held for the lifetime of the
+// surrounding transaction; concurrent writers targeting the same
+// (tenant, app) block until the transaction commits or rolls back.
+//
+// Used by service.DomainService.AddDomain to serialize concurrent
+// domain inserts against the same app so the per-app quota
+// (MaxDomainsPerApp) cannot be overshot by a count-then-insert race.
+// The same pattern is used by service.DeploymentService.ActivateDeployment
+// on the active_deployments row.
+//
+// Returns (nil, nil) when no app exists for (tenantID, appName) —
+// the service layer maps that to ErrAppNotFound.
+func (r *AppRepository) GetForUpdate(ctx context.Context, tenantID, appName string) (*domain.App, error) {
+	var app domain.App
+	query := `SELECT id, tenant_id, name, description, created_at FROM apps WHERE tenant_id = $1 AND name = $2 FOR UPDATE`
 	err := r.db.GetContext(ctx, &app, query, tenantID, appName)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -62,6 +92,36 @@ func (r *AppRepository) AtomicDelete(ctx context.Context, tenantID, appName stri
 	var deleted bool
 	err := r.db.GetContext(ctx, &deleted,
 		`DELETE FROM apps WHERE tenant_id = $1 AND name = $2 RETURNING true`,
+		tenantID, appName)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return deleted, err
+}
+
+// DeleteIfNoDeployments removes the apps row for (tenantID, appName)
+// only if it has zero deployments. Used as the compensating write
+// when DeploymentService.Deploy's artifact save fails on the very
+// first deploy of an app: CreateIfNotExists has just inserted an
+// apps row, the deployments row was created next, and then the
+// artifact save failed — both rows have been rolled back, but the
+// apps row remains orphaned unless we also delete it conditionally
+// on "no deployments ever succeeded for this app."
+//
+// The NOT EXISTS subquery makes the operation safe to call
+// concurrently with other deploys: if a concurrent successful
+// deploy exists (or appears during the call), the DELETE is a
+// no-op. Returns whether a row was deleted.
+func (r *AppRepository) DeleteIfNoDeployments(ctx context.Context, tenantID, appName string) (bool, error) {
+	var deleted bool
+	err := r.db.GetContext(ctx, &deleted,
+		`DELETE FROM apps
+		 WHERE tenant_id = $1 AND name = $2
+		   AND NOT EXISTS (
+		       SELECT 1 FROM deployments
+		       WHERE tenant_id = $1 AND app_name = $2
+		   )
+		 RETURNING true`,
 		tenantID, appName)
 	if err == sql.ErrNoRows {
 		return false, nil

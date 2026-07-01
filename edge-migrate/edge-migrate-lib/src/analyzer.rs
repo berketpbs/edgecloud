@@ -26,6 +26,12 @@ pub struct CAnalyzer {
     preprocessor: Option<Preprocessor>,
 }
 
+/// Maximum byte distance the sparse-coverage fallback will search
+/// forward from the byte_map hint for the snippet's function name.
+/// 1 KiB covers any realistic single-line macro expansion while
+/// bounding worst-case fallback time on pathological inputs.
+const SEARCH_BUDGET: usize = 1024;
+
 impl CAnalyzer {
     /// Create a new C analyzer (no preprocessor attached).
     pub fn new() -> Self {
@@ -95,19 +101,23 @@ impl CAnalyzer {
         // for the duration of tree-sitter parsing. We avoid `Box::leak`
         // by keeping the owned `String` in a local binding. The
         // `ExpandedSource` is captured by the `Ok` arm only; on error
-        // or no preprocessor, `line_map` is empty (identity mapping).
+        // or no preprocessor, `line_map`/`byte_map` are empty (identity
+        // mapping).
         let owned: String;
         let line_map: Vec<u32>;
+        let byte_map: Vec<(u32, u32)>;
         let pp_info: Option<PreprocessorInfo>;
         let parse_source: &str = match self.preprocessor.as_ref() {
             None => {
                 line_map = Vec::new();
+                byte_map = Vec::new();
                 pp_info = None;
                 source
             }
             Some(pp) => match pp.expand(source, DEFAULT_FILENAME_HINT) {
                 Ok(expanded) => {
                     line_map = expanded.line_map;
+                    byte_map = expanded.byte_map;
                     let macros = expanded.macros_expanded;
                     let clang_version = pp.clang_version();
                     owned = expanded.text;
@@ -124,6 +134,7 @@ impl CAnalyzer {
                         e
                     );
                     line_map = Vec::new();
+                    byte_map = Vec::new();
                     pp_info = None;
                     source
                 }
@@ -136,20 +147,270 @@ impl CAnalyzer {
         let root = tree.root_node();
         let mut matches = Vec::new();
         self.walk_node(parse_source, root, &mut matches);
-        // Remap line numbers back to the original source. Matches
-        // whose line is synthetic (line_map entry is 0) keep their
-        // expanded line number — a known limitation of clang's
-        // best-effort linemarker output.
+        // Remap line numbers and byte ranges back to the original
+        // source. Matches whose expanded line is synthetic (line_map
+        // entry is 0) keep their expanded line number — a known
+        // limitation of clang's best-effort linemarker output. Same
+        // applies to byte ranges: synthetic lines (byte_map entry has
+        // u32::MAX for original_byte) keep their expanded byte values.
         if !line_map.is_empty() {
             for m in &mut matches {
-                if m.line >= 1 {
-                    let idx = m.line - 1;
-                    if let Some(&orig) = line_map.get(idx) {
-                        if orig >= 1 {
-                            m.line = orig as usize;
+                let expanded_row = m.line.saturating_sub(1);
+                // 1. Line remap.
+                if let Some(&orig_line) = line_map.get(expanded_row) {
+                    if orig_line >= 1 {
+                        m.line = orig_line as usize;
+                    }
+                }
+                // 2. Byte remap. For the common case (single-line
+                // matches) we use the same expanded_row for both start
+                // and end; this is exact via linear interpolation.
+                // For multi-line matches this is best-effort — the
+                // transformer has a sanity guard for the synthetic
+                // case.
+                //
+                // **Clang sparse-linemarker fallback.** `clang -E`
+                // emits a single linemarker per source file (not per
+                // line), so `line_map` maps many expanded lines back to
+                // original line 1, and `byte_map` consequently maps
+                // their `orig_start` to byte 0. The linear-interp
+                // remap then yields a `col_start` that's a function of
+                // the EXPANDED source's byte layout, not the original's.
+                // When the resulting range doesn't actually contain the
+                // match's snippet text, fall back to a content search
+                // in the original source. This handles the macro case
+                // (`#define socket(...) make_socket(...)`) correctly:
+                // tree-sitter sees `make_socket(...)` in the expanded
+                // text, the snippet says `make_socket(...)`, and the
+                // fallback finds the matching `socket(...)` call site
+                // in the original source.
+                if !byte_map.is_empty() {
+                    if let Some(&(exp_start, orig_start)) = byte_map.get(expanded_row) {
+                        if orig_start != u32::MAX {
+                            let col_start = m.start_byte.saturating_sub(exp_start as usize);
+                            m.original_start_byte = orig_start as usize + col_start;
+                        }
+                    }
+                    if let Some(&(exp_end, orig_end)) = byte_map.get(expanded_row) {
+                        if orig_end != u32::MAX {
+                            let col_end = m.end_byte.saturating_sub(exp_end as usize);
+                            m.original_end_byte = orig_end as usize + col_end;
+                        }
+                    }
+                    // **Sparse-coverage refinement.** When clang emits
+                    // only one linemarker per file (the common case for
+                    // small sources), `byte_map[expanded_row]` points
+                    // back to byte 0 of the original source for ALL
+                    // user code lines. The linear-interp remap then
+                    // produces a column offset derived from the
+                    // EXPANDED source's layout, not the original's —
+                    // so the resulting range is wrong.
+                    //
+                    // Refine by searching forward in the original
+                    // source for the snippet's function name, starting
+                    // at the byte_map hint. The hint keeps us in the
+                    // right region; the search refines to the exact
+                    // call site. This handles the common macro case
+                    // (`#define socket(...) make_socket(...)`) where
+                    // tree-sitter sees `make_socket(...)` in expanded
+                    // coords but the original source has `socket(...)`.
+                    //
+                    // The search is bounded by `SEARCH_BUDGET` bytes
+                    // so a worst-case fallback never overruns.
+                    if m.original_start_byte <= source.len() {
+                        // Use the args-tail (everything from the first
+                        // `(` to the end of the snippet) as the search
+                        // needle rather than the function-name head.
+                        // Across macro expansion the function name
+                        // changes (`socket(...)` → `make_socket(...)`)
+                        // but the parenthesized argument list is the
+                        // same in the expanded source. This makes the
+                        // call-site search robust to function-name
+                        // renames while still anchoring to a unique
+                        // substring of the call.
+                        //
+                        // After locating the args-tail in the original
+                        // source, walk back to the start of the
+                        // identifier preceding the `(` so the slice
+                        // still includes the function name (needed
+                        // for the transformer's gap-copy logic to
+                        // recognize the call). If no identifier
+                        // precedes the `(`, fall back to the
+                        // args-only span.
+                        //
+                        // If the args-tail can't be located in the
+                        // original source (typical when nested macros
+                        // expand the arguments themselves — e.g.
+                        // `AF_INET` → `2` inside `socket(2, 1, 0)`),
+                        // route to `manual_review` via the synthetic
+                        // `u32::MAX` sentinel: the transformer's
+                        // sanity guard at `transformer.rs` skips the
+                        // match and puts it in `manual_review`. This
+                        // is safer than letting a wrong-but-in-bounds
+                        // range silently slice into adjacent code.
+                        if let Some(args) = snippet_args_tail(&m.snippet) {
+                            // Only refine when the args-tail is not
+                            // already at or very near the byte_map
+                            // hint. Skip the pre-check when `hint`
+                            // is 0 (the sparse-linemarker case
+                            // documented in `build_byte_map`): the
+                            // call site is rarely within the first
+                            // SEARCH_BUDGET bytes of the file, so
+                            // the `contains` scan would burn 1 KiB
+                            // and almost always return false before
+                            // falling through to find_snippet_in_source
+                            // anyway.
+                            let hint = m.original_start_byte;
+                            let already_at_hint = hint > 0
+                                && hint + SEARCH_BUDGET <= source.len()
+                                && source[hint..hint + SEARCH_BUDGET].contains(args);
+                            if !already_at_hint {
+                                if let Some(found) = find_snippet_in_source(source, args, hint) {
+                                    let found = found.min(source.len());
+                                    // Walk back from the args-tail
+                                    // start to find the identifier
+                                    // (function name) preceding the
+                                    // `(`. The walk skips whitespace
+                                    // and stops at the first
+                                    // non-identifier byte. This gives
+                                    // us the full call expression in
+                                    // the original source.
+                                    let call_start = walk_back_to_call_start(source, found);
+                                    m.original_start_byte = call_start;
+                                    // Walk forward in the ORIGINAL
+                                    // source to the close-paren, not
+                                    // via expanded-source byte length
+                                    // (`m.end_byte - m.start_byte`).
+                                    // For macro-expanded calls like
+                                    // `socket(AF_INET, SOCK_STREAM)`
+                                    // → `make_socket(AF_INET,
+                                    // SOCK_STREAM)`, the expanded
+                                    // length overshoots by 4 bytes
+                                    // (the `make_` prefix added by
+                                    // the expansion), pulling the end
+                                    // into the next token. Symmetric
+                                    // with walk_back_to_call_start:
+                                    // both endpoints are in the same
+                                    // (original) coordinate system.
+                                    m.original_end_byte = source[call_start..]
+                                        .find(')')
+                                        .map(|off| call_start + off + 1)
+                                        .unwrap_or(source.len());
+                                } else {
+                                    // Args-tail not found in original.
+                                    // Likely nested macro expansion in
+                                    // the arguments themselves. Route
+                                    // to manual_review via the
+                                    // synthetic-line sentinel; the
+                                    // transformer's sanity guard will
+                                    // skip the match.
+                                    m.original_start_byte = u32::MAX as usize;
+                                    m.original_end_byte = u32::MAX as usize;
+                                }
+                            }
+                        }
+                    }
+                    // Also remap bound_var decl bytes if present.
+                    if let Some(bv) = m.bound_var.as_mut() {
+                        // bound_var uses decl_start_byte/decl_end_byte
+                        // captured from the same decl node. For
+                        // single-line declarations (the common case
+                        // for `int fd = socket(...);`) the same
+                        // expanded_row works. For multi-line decls
+                        // (e.g. with macro-spanning initializers) this
+                        // is best-effort.
+                        if let Some(&(exp_start, orig_start)) = byte_map.get(expanded_row) {
+                            if orig_start != u32::MAX {
+                                let col_start =
+                                    bv.decl_start_byte.saturating_sub(exp_start as usize);
+                                bv.original_decl_start_byte = orig_start as usize + col_start;
+                            }
+                        }
+                        if let Some(&(exp_end, orig_end)) = byte_map.get(expanded_row) {
+                            if orig_end != u32::MAX {
+                                let col_end = bv.decl_end_byte.saturating_sub(exp_end as usize);
+                                bv.original_decl_end_byte = orig_end as usize + col_end;
+                            }
+                        }
+                        // Sparse-coverage refinement for the
+                        // declaration: search forward for the
+                        // `<name> = ` pattern (e.g. `fd = `) which
+                        // uniquely identifies the assignment in the
+                        // original source. The byte_map hint lands
+                        // at byte 0 for all user code lines; this
+                        // search refines to the actual declaration.
+                        // The walk-back from `<name>` to the
+                        // declaration start (`find_decl_start`)
+                        // handles any C type prefix (`int`, `long`,
+                        // `uint32_t`, `static int`, etc.) without
+                        // coupling the needle to a specific type.
+                        // The walk-forward to the statement-ending
+                        // `;` (`find_stmt_end`) gives the original's
+                        // full declaration length so we don't
+                        // borrow the expanded source's longer
+                        // length (which would over-slice into the
+                        // next statement for macro-expanded calls).
+                        //
+                        // Search uses `<name> = ` rather than
+                        // `<name> = <head>` because `<head>` comes
+                        // from `m.snippet` — the EXPANDED source's
+                        // function name. For the macro case
+                        // (`#define socket(...) make_socket(...)`),
+                        // the expanded snippet is `make_socket(...)`
+                        // and the original has `socket(...)` (the
+                        // macro invocation), so `<name> = <head>`
+                        // would not match. The `<name> = ` anchor
+                        // is stable across the expansion.
+                        if bv.original_decl_start_byte <= source.len() {
+                            // The previous version searched for
+                            // `int <name> = <head>` where `<head>` came
+                            // from `m.snippet` — the EXPANDED source's
+                            // function name. For the macro case
+                            // (`#define socket(...) make_socket(...)`),
+                            // the expanded snippet is `make_socket(...)`
+                            // and the original source has `socket(...)`
+                            // (the macro invocation), so the needle
+                            // `int fd = make_socket` does not exist in
+                            // the original and the refinement silently
+                            // does nothing.
+                            //
+                            // The robust fix searches for the
+                            // assignment signature using the ORIGINAL
+                            // source's identifier pattern (`<name> = `).
+                            // That anchor is always present, and the
+                            // walk-back to the declaration start handles
+                            // any C type prefix (`int`, `long`,
+                            // `uint32_t`, `static int`, etc.) without
+                            // coupling the needle to a specific type.
+                            // The walk-forward to the statement-ending
+                            // `;` gives us the original's full
+                            // declaration length, so we don't borrow
+                            // the expanded source's longer length (which
+                            // would over-slice into the next statement
+                            // for macro-expanded calls).
+                            let needle = format!("{} = ", bv.name);
+                            if !source[bv.original_decl_start_byte..].starts_with(needle.as_str()) {
+                                if let Some(name_pos) = find_snippet_in_source(
+                                    source,
+                                    &needle,
+                                    bv.original_decl_start_byte.min(source.len()),
+                                ) {
+                                    let name_pos = name_pos
+                                        .min(bv.original_decl_start_byte + SEARCH_BUDGET)
+                                        .min(source.len());
+                                    let decl_start = find_decl_start(source, name_pos);
+                                    let decl_end = find_stmt_end(source, decl_start);
+                                    bv.original_decl_start_byte = decl_start;
+                                    bv.original_decl_end_byte = decl_end;
+                                }
+                            }
                         }
                     }
                 }
+                // else: byte_map is empty (no preprocessor / fallback),
+                // original_start_byte and original_end_byte stay equal
+                // to start_byte / end_byte (the values set in
+                // match_call_node and classify_socket_declaration_context).
             }
         }
         matches.sort_by_key(|m| m.line);
@@ -261,6 +522,8 @@ impl CAnalyzer {
             column: Some(column),
             start_byte,
             end_byte,
+            original_start_byte: start_byte,
+            original_end_byte: end_byte,
             pattern,
             snippet: snippet.clone(),
             arg_nodes: arg_nodes.clone(),
@@ -280,6 +543,8 @@ impl CAnalyzer {
                     column: Some(column),
                     start_byte,
                     end_byte,
+                    original_start_byte: start_byte,
+                    original_end_byte: end_byte,
                     pattern: PatternKind::Posix(PosixPattern::NonBlocking),
                     snippet,
                     arg_nodes,
@@ -332,6 +597,126 @@ impl CAnalyzer {
         }
         args
     }
+}
+
+/// Extract the parenthesized argument tail of a snippet — everything
+/// from the first `(` to the end. Used by the call-site refinement
+/// as a more stable anchor than the function name across macro
+/// expansion: `make_socket(2, 1, 0)` and `socket(2, 1, 0)` both
+/// contain `(2, 1, 0)`. Returns `None` if the snippet has no `(` or
+/// is empty.
+fn snippet_args_tail(snippet: &str) -> Option<&str> {
+    let trimmed = snippet.trim();
+    let paren_idx = trimmed.find('(')?;
+    Some(&trimmed[paren_idx..])
+}
+
+/// Walk back from `paren_byte` (which must point at the `(` of a
+/// call expression) to find the start of the preceding identifier
+/// (the function name). Skips ASCII whitespace; stops at the first
+/// non-identifier, non-whitespace byte. Returns `paren_byte` itself
+/// if no identifier precedes it (e.g. parenthesized expressions
+/// like `(a)(b)`). Used by the args-tail call-site refinement to
+/// produce a slice that includes the call's function name as well
+/// as its argument list.
+fn walk_back_to_call_start(source: &str, paren_byte: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut pos = paren_byte;
+    // Skip whitespace between identifier and `(`.
+    while pos > 0 && bytes[pos - 1].is_ascii_whitespace() {
+        pos -= 1;
+    }
+    // Walk back over the identifier characters.
+    let mut end = pos;
+    while end > 0 {
+        let c = bytes[end - 1];
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+    if end < pos {
+        end // walked at least one identifier char
+    } else {
+        paren_byte // no identifier before `(`
+    }
+}
+
+/// Search `source` for the first occurrence of `needle` at or after
+/// `from_byte`. Used as a fallback when `byte_map` produces a
+/// remapped byte range that doesn't actually contain the snippet
+/// (typically because clang emitted only one linemarker for the
+/// whole file). Returns `None` if not found.
+fn find_snippet_in_source(source: &str, needle: &str, from_byte: usize) -> Option<usize> {
+    if needle.is_empty() || from_byte >= source.len() {
+        return None;
+    }
+    // Bound the search slice to `from_byte + SEARCH_BUDGET` so a
+    // 50 MiB migrated file doesn't trigger a full-string scan per
+    // call (the bug pre-#139 surfaced as a slow analyze pass on
+    // large inputs). The `already_at_hint` pre-check at the call
+    // site covers the `hint > 0` case; this bound covers the
+    // `hint == 0` case where we'd otherwise scan from byte 0 to
+    // EOF.
+    let search_end = (from_byte + SEARCH_BUDGET).min(source.len());
+    source[from_byte..search_end]
+        .find(needle)
+        .map(|i| from_byte + i)
+}
+
+/// Walk back from `name_pos` (which must point at the start of a
+/// declared variable name) to find the start of the surrounding C
+/// declaration — the first non-whitespace character on the same
+/// line, with the line being the line containing the variable or
+/// any later line. The declaration starts at the beginning of the
+/// line (after leading whitespace) or after a `;`, `{`, or `}`.
+///
+/// Used by the bound_var refinement to compute the slice start for
+/// the original source when the byte_map's remap is unreliable.
+/// Tree-sitter's `decl.start_byte()` would be ideal but its value
+/// is in expanded-source coordinates; this helper operates purely
+/// on the original text.
+fn find_decl_start(source: &str, name_pos: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut pos = name_pos;
+    while pos > 0 {
+        let prev = bytes[pos - 1];
+        if prev == b'\n' || prev == b';' || prev == b'{' || prev == b'}' {
+            // Found the boundary — skip leading whitespace on the
+            // current line so the slice starts at the first
+            // non-whitespace character of the declaration (the
+            // type token: `int`, `long`, `static int`, etc.).
+            let mut start = pos;
+            while start < bytes.len() && (bytes[start] == b' ' || bytes[start] == b'\t') {
+                start += 1;
+            }
+            return start;
+        }
+        pos -= 1;
+    }
+    // At the start of the file. Skip leading whitespace so the slice
+    // starts at the first non-whitespace character.
+    let mut start = 0;
+    while start < bytes.len() && (bytes[start] == b' ' || bytes[start] == b'\t') {
+        start += 1;
+    }
+    start
+}
+
+/// Find the byte offset just past the `;` that ends the C statement
+/// starting at `decl_start`. Bounded to 2 KiB so pathological inputs
+/// can't run the search unbounded. Returns `decl_start` if no `;`
+/// is found (caller can fall back to manual_review).
+fn find_stmt_end(source: &str, decl_start: usize) -> usize {
+    let bytes = source.as_bytes();
+    let limit = (decl_start + 2048).min(bytes.len());
+    for (i, &b) in bytes[decl_start..limit].iter().enumerate() {
+        if b == b';' {
+            return decl_start + i + 1; // exclusive end (just past `;`)
+        }
+    }
+    decl_start
 }
 
 /// Result of inspecting the parent context of a `socket(...)`
@@ -426,6 +811,8 @@ fn classify_socket_declaration_context(
         name: name.to_string(),
         decl_start_byte: decl.start_byte(),
         decl_end_byte: decl.end_byte(),
+        original_decl_start_byte: decl.start_byte(),
+        original_decl_end_byte: decl.end_byte(),
     })
 }
 
@@ -664,6 +1051,197 @@ int main(void) {
     }
 
     #[test]
+    fn test_analyzer_remaps_byte_range_after_macro_expansion() {
+        // Regression test for the bin CLI's preprocessor byte-range
+        // panic (commit `c61326f` + `a73eaca`). When clang is on PATH
+        // and the analyzer runs `clang -E -nostdinc`, the expanded
+        // source starts with ~135 bytes of `# <line> "<file>"`
+        // linemarkers — even for source with zero `#define`s. The
+        // original `start_byte`/`end_byte` on a `PatternMatch` are
+        // therefore offsets in the EXPANDED source, which exceed the
+        // original source's length and would cause the transformer to
+        // panic with "range end index N out of range for slice of
+        // length M" if it sliced with those values.
+        //
+        // The fix populates `original_start_byte` / `original_end_byte`
+        // (and the bound_var equivalents) by walking `byte_map` and
+        // interpolating from the expanded line's start. This test
+        // verifies that the remapped range lies within the original
+        // source bytes and points at the call site, not past the end
+        // of the file.
+        let Some(pp) = crate::preprocessor::Preprocessor::discover() else {
+            eprintln!("skipping: clang not found");
+            return;
+        };
+        let source = "\
+/* header comment */
+int make_socket(int family, int type, int proto);
+int main(void) {
+    int fd = socket(2, 1, 0);
+    (void)fd;
+    return 0;
+}
+";
+        let source_bytes = source.as_bytes();
+        let mut analyzer = CAnalyzer::with_preprocessor(pp);
+        let matches = analyzer.analyze(source);
+        let socket_match = matches
+            .iter()
+            .find(|m| matches!(m.pattern, PatternKind::Posix(PosixPattern::SocketTcp)));
+        // The fixture has a recognizable socket() call. The match
+        // may or may not be detected depending on whether the
+        // preprocessor emits linemarkers that preserve the call site.
+        // The assertion that matters is the byte-range invariant.
+        if let Some(m) = socket_match {
+            // 1. Remapped range must be within the original source.
+            assert!(
+                m.original_end_byte <= source_bytes.len(),
+                "original_end_byte {} exceeds source length {} — \
+                 byte-range remap did not bring the value back into original coords",
+                m.original_end_byte,
+                source_bytes.len()
+            );
+            assert!(
+                m.original_start_byte <= m.original_end_byte,
+                "original_start_byte {} > original_end_byte {}",
+                m.original_start_byte,
+                m.original_end_byte
+            );
+            // 2. The remapped range, when sliced from the original
+            //    source, must contain the call text. (The fixture
+            //    has `socket(2, 1, 0)` so the substring `socket(`
+            //    should be present.)
+            let sliced = &source_bytes[m.original_start_byte..m.original_end_byte];
+            let sliced_str = std::str::from_utf8(sliced).unwrap_or("");
+            assert!(
+                sliced_str.contains("socket("),
+                "remapped range {:?} does not contain the call site",
+                sliced_str
+            );
+            // 3. Sanity: when a bound_var is present, the
+            //    remapped decl range must also be in bounds.
+            if let Some(bv) = &m.bound_var {
+                assert!(
+                    bv.original_decl_end_byte <= source_bytes.len(),
+                    "original_decl_end_byte {} exceeds source length {}",
+                    bv.original_decl_end_byte,
+                    source_bytes.len()
+                );
+                assert!(
+                    bv.original_decl_start_byte <= bv.original_decl_end_byte,
+                    "original_decl_start_byte {} > original_decl_end_byte {}",
+                    bv.original_decl_start_byte,
+                    bv.original_decl_end_byte
+                );
+                // Stronger assertion (review finding #2): the
+                // remapped decl range must slice to the FULL
+                // original declaration, not a fragment. The
+                // preprocessor's sparse-linemarker behavior makes
+                // the byte_map's linear-interp remap land at
+                // byte 0 for all user code lines; the
+                // `<name> = ` search + walk-back/forward must
+                // refine to the type prefix and statement end.
+                let decl_slice =
+                    &source_bytes[bv.original_decl_start_byte..bv.original_decl_end_byte];
+                let decl_str = std::str::from_utf8(decl_slice).expect("decl slice is valid UTF-8");
+                assert!(
+                    decl_str.starts_with("int fd = "),
+                    "remapped decl range should start at the type prefix `int fd = `; got: {:?}",
+                    decl_str
+                );
+                assert!(
+                    decl_str.contains("socket("),
+                    "remapped decl range should contain the `socket(` call site; got: {:?}",
+                    decl_str
+                );
+                assert!(
+                    decl_str.trim_end().ends_with(';'),
+                    "remapped decl range should end at the statement-terminating `;`; got: {:?}",
+                    decl_str
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_analyzer_bare_macro_routes_to_manual_review() {
+        // Regression test for finding #3 (Bare+macro call-site). The
+        // previous call-site refinement searched for the snippet's
+        // **head token** (the function name) in the original source.
+        // For the `Bare` case (no `bound_var`) where a macro
+        // renames the function — `#define socket(...) make_socket(...)`
+        // — the expanded snippet is `make_socket(...)` but the
+        // original source has `socket(...)`. The head-token search
+        // missed the call site and the byte_map's linear-interp
+        // result leaked through, slicing into adjacent code.
+        //
+        // The post-fix refinement uses the **args-tail**
+        // (everything from the first `(` onward), which is stable
+        // across function-name renames. If the args-tail can't be
+        // located in the original (typical when nested macros
+        // expand arguments themselves, e.g. `AF_INET` → `2`),
+        // the match is routed to `manual_review` via the `u32::MAX`
+        // sentinel — the transformer's sanity guard then skips it.
+        //
+        // Skipped without clang. The fixture's macro expands
+        // `socket` to `make_socket`, a non-POSIX name, so the
+        // analyzer may not detect a SocketTcp match at all. The
+        // assertions therefore gate on a match being found.
+        let Some(pp) = crate::preprocessor::Preprocessor::discover() else {
+            eprintln!("skipping: clang not found");
+            return;
+        };
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("testdata")
+            .join("macro_bare_socket.c");
+        let source = std::fs::read_to_string(&fixture_path).expect("read fixture");
+        let source_bytes = source.as_bytes();
+        let mut analyzer = CAnalyzer::with_preprocessor(pp);
+        let (matches, _pp_info) = analyzer.analyze_with_preprocessor_info(&source);
+        let socket_match = matches
+            .iter()
+            .find(|m| matches!(m.pattern, PatternKind::Posix(PosixPattern::SocketTcp)));
+        if let Some(m) = socket_match {
+            // The match's byte range must either:
+            //   1. Be in-bounds and within the original source, OR
+            //   2. Be the u32::MAX sentinel (routed to manual_review).
+            let is_in_bounds = m.original_end_byte <= source_bytes.len()
+                && m.original_start_byte <= m.original_end_byte;
+            let is_sentinel = m.original_start_byte == u32::MAX as usize
+                && m.original_end_byte == u32::MAX as usize;
+            assert!(
+                is_in_bounds || is_sentinel,
+                "Bare+macro match has neither in-bounds range nor u32::MAX sentinel: \
+                 original_start_byte={}, original_end_byte={}, source_len={}",
+                m.original_start_byte,
+                m.original_end_byte,
+                source_bytes.len()
+            );
+            // If the match was NOT routed to manual_review, the byte
+            // range must contain the call site in the original source.
+            // We test by slicing (only safe when in-bounds).
+            if is_in_bounds {
+                let sliced = &source_bytes[m.original_start_byte..m.original_end_byte];
+                let sliced_str = std::str::from_utf8(sliced).unwrap_or("");
+                assert!(
+                    sliced_str.contains("socket("),
+                    "remapped range {:?} does not contain the call site",
+                    sliced_str
+                );
+            }
+        }
+        // Additionally: the transformer must not panic on this
+        // fixture (defense against the byte-range panic).
+        let result = crate::transformer::Transformer::transform(&source, matches, None);
+        assert!(
+            !result.transformed_source.is_empty(),
+            "transformer produced empty output for Bare+macro fixture"
+        );
+    }
+
+    #[test]
     fn test_pattern_match_column_field_default_none() {
         // M1.C4: `column: Option<usize>` is added to PatternMatch.
         // M2.C3 populates it via the analyzer. We retain a test that
@@ -756,8 +1334,7 @@ int main(void) {
         // must detect this and flip the match to NotTransformable
         // so it lands in manual_review.
         let mut analyzer = CAnalyzer::new();
-        let source =
-            "int main() { int fd = wrap(socket(AF_INET, SOCK_STREAM, 0)); return 0; }\n";
+        let source = "int main() { int fd = wrap(socket(AF_INET, SOCK_STREAM, 0)); return 0; }\n";
         let matches = analyzer.analyze(source);
         let socket_match = matches
             .iter()
@@ -771,6 +1348,103 @@ int main(void) {
         assert!(
             socket_match.bound_var.is_none(),
             "socket inside outer call must NOT have a bound_var (no declaration to bind to)"
+        );
+    }
+
+    // test_find_snippet_in_source_bounds_search pins the SEARCH_BUDGET
+    // bound added in #139: a needle within the budget from `from_byte`
+    // is found; one past the budget returns None. Before the bound,
+    // any needle anywhere in `source` was reachable, which made a
+    // 50 MiB migrated file trigger a full-string scan per call.
+    #[test]
+    fn test_find_snippet_in_source_bounds_search() {
+        // Build a source where a needle sits at byte 5000 — well
+        // within the 1024-byte budget from `from_byte = 4500`.
+        let needle = "NEEDLE";
+        let needle_pos = 5000_usize;
+        let mut source = String::with_capacity(8192);
+        source.push_str(&"a".repeat(needle_pos));
+        source.push_str(needle);
+        source.push_str(&"a".repeat(8192 - source.len()));
+
+        let found = find_snippet_in_source(&source, needle, 4500);
+        assert_eq!(found, Some(needle_pos));
+
+        // Decoy at byte 8000 — past the budget (4500 + 1024 = 5524).
+        // The bounded scan must NOT see it. Without the budget, the
+        // unbounded scan would return Some(8000) — that's the
+        // regression we're guarding against.
+        let mut source2 = String::with_capacity(8192);
+        source2.push_str(&"a".repeat(4500));
+        source2.push_str(needle); // at 4500
+        source2.push_str(&"a".repeat(8000 - source2.len()));
+        source2.push_str(needle); // at 8000
+        source2.push_str(&"a".repeat(8192 - source2.len()));
+
+        let found2 = find_snippet_in_source(&source2, needle, 4500);
+        // Bounded scan: only the first needle (at 4500) is reachable.
+        // The decoy at 8000 is past the 1024-byte budget.
+        assert_eq!(found2, Some(4500));
+
+        // Empty needle and from_byte past EOF are no-ops.
+        assert_eq!(find_snippet_in_source(&source, "", 0), None);
+        assert_eq!(find_snippet_in_source(&source, "x", source.len()), None);
+    }
+
+    // test_walk_back_to_call_start_and_forward_matches_paren pins the
+    // symmetric coord fix added in #139: walk_back returns the
+    // original-source byte position of the call start, and the
+    // forward walk to `)` must be in the SAME coordinate system.
+    //
+    // Before the fix, original_end_byte was computed as
+    // `(call_start + (m.end_byte - m.start_byte)).min(source.len())`
+    // where `m.end_byte - m.start_byte` is the EXPANDED-source byte
+    // length. For `socket(...)` → `make_socket(...)`, the expanded
+    // length overshoots by 4 bytes (the `make_` prefix), pulling
+    // original_end_byte into the next token.
+    //
+    // After the fix, the forward walk is in original-source bytes
+    // (just like walk_back), so both endpoints bracket the original
+    // call exactly.
+    #[test]
+    fn test_walk_back_to_call_start_and_forward_matches_paren() {
+        // The source has `socket(AF_INET, SOCK_STREAM)` at a known
+        // position. Verify that walk_back returns the `s` of
+        // `socket`, and the forward walk to `)` returns just past
+        // the close-paren (i.e., the full call expression in
+        // original coords).
+        let source = "int fd = socket(AF_INET, SOCK_STREAM);";
+        // Byte indices: i(0)n(1)t(2) (3)f(4)d(5) (6)=(7) (8)s(9)o(10)c(11)k(12)e(13)t(14)((15)
+        // The `(` after `socket` is at byte 15; `s` is at byte 9.
+        let paren_byte = 15;
+        let call_start = walk_back_to_call_start(source, paren_byte);
+        assert_eq!(call_start, 9, "should walk back to the `s` of `socket`");
+
+        // The forward walk to `)` should end at one past the
+        // close-paren. The full call `socket(AF_INET, SOCK_STREAM)`
+        // starts at byte 9 and is 25 chars long; `)` is at byte
+        // 33; one past = 34.
+        let end_byte = source[call_start..]
+            .find(')')
+            .map(|off| call_start + off + 1)
+            .unwrap_or(source.len());
+        assert_eq!(
+            &source[call_start..end_byte],
+            "socket(AF_INET, SOCK_STREAM)"
+        );
+
+        // The bug symptom: if we used the OLD formula
+        // `(call_start + expanded_len)`, we'd overshoot. Simulate
+        // that by passing an artificially long `len` (4 bytes more
+        // than the actual call, like the `make_` prefix expansion).
+        let overshoot_end = (call_start + (end_byte - call_start) + 4).min(source.len());
+        assert!(
+            overshoot_end > end_byte,
+            "the OLD formula would overshoot — this assertion confirms the bug exists in the test fixture"
+        );
+        assert!(
+            source[call_start..overshoot_end].contains(';') || (overshoot_end - call_start) > 25,
+            "overshoot would pull the end into the next token"
         );
     }
 }

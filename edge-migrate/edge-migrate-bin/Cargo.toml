@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 edge-migrate-lib = { path = "../edge-migrate-lib", features = ["rust"] }
@@ -12,7 +13,9 @@ clap = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+futures-util = "0.3"
 
 [dev-dependencies]
 serde_json = { workspace = true }

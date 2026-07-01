@@ -14,12 +14,14 @@ import (
 
 // mockAppRepo implements appRepoInterface for testing.
 type mockAppRepo struct {
-	createFunc            func(ctx context.Context, app *domain.App) error
-	getFunc               func(ctx context.Context, tenantID, appName string) (*domain.App, error)
-	listFunc              func(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error)
-	countByTenantFunc     func(ctx context.Context, tenantID string) (int, error)
-	atomicDeleteFunc      func(ctx context.Context, tenantID, appName string) (bool, error)
-	insertIfNotExistsFunc func(ctx context.Context, app *domain.App) (bool, error)
+	createFunc                func(ctx context.Context, app *domain.App) error
+	getFunc                   func(ctx context.Context, tenantID, appName string) (*domain.App, error)
+	listFunc                  func(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error)
+	countByTenantFunc         func(ctx context.Context, tenantID string) (int, error)
+	atomicDeleteFunc          func(ctx context.Context, tenantID, appName string) (bool, error)
+	insertIfNotExistsFunc     func(ctx context.Context, app *domain.App) (bool, error)
+	getForUpdateFunc          func(ctx context.Context, tenantID, appName string) (*domain.App, error)
+	deleteIfNoDeploymentsFunc func(ctx context.Context, tenantID, appName string) (bool, error)
 }
 
 func (m *mockAppRepo) Create(ctx context.Context, app *domain.App) error {
@@ -60,6 +62,20 @@ func (m *mockAppRepo) AtomicDelete(ctx context.Context, tenantID, appName string
 func (m *mockAppRepo) InsertIfNotExists(ctx context.Context, app *domain.App) (bool, error) {
 	if m.insertIfNotExistsFunc != nil {
 		return m.insertIfNotExistsFunc(ctx, app)
+	}
+	return false, nil
+}
+
+func (m *mockAppRepo) GetForUpdate(ctx context.Context, tenantID, appName string) (*domain.App, error) {
+	if m.getForUpdateFunc != nil {
+		return m.getForUpdateFunc(ctx, tenantID, appName)
+	}
+	return nil, nil
+}
+
+func (m *mockAppRepo) DeleteIfNoDeployments(ctx context.Context, tenantID, appName string) (bool, error) {
+	if m.deleteIfNoDeploymentsFunc != nil {
+		return m.deleteIfNoDeploymentsFunc(ctx, tenantID, appName)
 	}
 	return false, nil
 }
@@ -367,7 +383,7 @@ func TestAppService_CreateIfNotExists_InvalidName(t *testing.T) {
 // TestAppService_Delete_ArtifactCleanup verifies that Delete removes .wasm artifact files.
 func TestAppService_Delete_ArtifactCleanup(t *testing.T) {
 	tmpDir := t.TempDir()
-	artifactStore := storage.NewArtifactStore(tmpDir)
+	artifactStore := storage.NewFSArtifactStore(tmpDir)
 
 	// Create some "deployment" artifacts on disk
 	deployments := []struct {
@@ -404,7 +420,7 @@ func TestAppService_Delete_ArtifactCleanup(t *testing.T) {
 // removes the file and returns nil when the file exists.
 func TestArtifactStore_Delete_RemovesFile(t *testing.T) {
 	tmpDir := t.TempDir()
-	artifactStore := storage.NewArtifactStore(tmpDir)
+	artifactStore := storage.NewFSArtifactStore(tmpDir)
 
 	deployID := "d_test1"
 	path, err := artifactStore.Path("t_tenant1", "my-app", deployID)
@@ -418,11 +434,62 @@ func TestArtifactStore_Delete_RemovesFile(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	err = artifactStore.Delete("t_tenant1", "my-app", deployID)
+	err = artifactStore.Delete(context.Background(), "t_tenant1", "my-app", deployID)
 	if err != nil {
 		t.Errorf("Delete() error = %v, want nil", err)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Errorf("artifact file still exists after Delete")
+	}
+}
+
+// TestAppService_DeleteIfNoDeployments_PassesThrough verifies the
+// service method delegates to the repo with the exact tenant/app
+// arguments and surfaces both the bool (was a row deleted?) and
+// the error. This is the compensating-write path called by
+// DeploymentService.Deploy when the first deploy of an app fails
+// at artifact save — we want to make sure the call wires through
+// rather than getting silently swallowed by an interface mismatch.
+func TestAppService_DeleteIfNoDeployments_PassesThrough(t *testing.T) {
+	var gotTenant, gotApp string
+	repo := &mockAppRepo{
+		deleteIfNoDeploymentsFunc: func(_ context.Context, tenantID, appName string) (bool, error) {
+			gotTenant = tenantID
+			gotApp = appName
+			return true, nil
+		},
+	}
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
+
+	deleted, err := svc.DeleteIfNoDeployments(context.Background(), "t_test", "myapp")
+	if err != nil {
+		t.Fatalf("DeleteIfNoDeployments err = %v, want nil", err)
+	}
+	if !deleted {
+		t.Error("expected deleted=true from mock, got false")
+	}
+	if gotTenant != "t_test" || gotApp != "myapp" {
+		t.Errorf("repo called with tenant=%q app=%q, want t_test/myapp", gotTenant, gotApp)
+	}
+}
+
+// TestAppService_DeleteIfNoDeployments_RepoErrorSurfaces verifies
+// the method surfaces repo errors (the rollback caller logs and
+// continues, but it must at least see the error to log it). The
+// bool result alongside the error is the standard sqlx shape.
+func TestAppService_DeleteIfNoDeployments_RepoErrorSurfaces(t *testing.T) {
+	repo := &mockAppRepo{
+		deleteIfNoDeploymentsFunc: func(_ context.Context, _, _ string) (bool, error) {
+			return false, errors.New("db gone (test)")
+		},
+	}
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
+
+	deleted, err := svc.DeleteIfNoDeployments(context.Background(), "t_test", "myapp")
+	if err == nil {
+		t.Fatal("expected error from repo, got nil")
+	}
+	if deleted {
+		t.Error("expected deleted=false alongside error")
 	}
 }

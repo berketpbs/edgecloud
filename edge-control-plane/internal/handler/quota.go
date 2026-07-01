@@ -1,20 +1,27 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
-	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
+
+// QuotaServiceInterface is the subset of service.TenantServiceInterface used by QuotaHandler.
+type QuotaServiceInterface interface {
+	GetQuota(ctx context.Context, tenantID string) (*domain.Quota, error)
+}
 
 // QuotaHandler handles quota HTTP requests.
 type QuotaHandler struct {
-	tenantSvc service.TenantServiceInterface
+	tenantSvc QuotaServiceInterface
 }
 
-func NewQuotaHandler(tenantSvc service.TenantServiceInterface) *QuotaHandler {
+func NewQuotaHandler(tenantSvc QuotaServiceInterface) *QuotaHandler {
 	return &QuotaHandler{tenantSvc: tenantSvc}
 }
 
@@ -33,5 +40,7 @@ func (h *QuotaHandler) GetQuota(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(quota)
+	if err := json.NewEncoder(w).Encode(quota); err != nil {
+		log.Printf("GetQuota: failed to encode response: %v", err)
+	}
 }

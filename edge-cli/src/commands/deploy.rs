@@ -107,7 +107,7 @@ fn run_activate(path: &Path, app: &str, deployment_id: &str) -> Result<()> {
     let base_url = edge_toml.api_url("https://api.edgecloud.dev");
 
     let client = ApiClient::new(base_url)?;
-    client.activate(&app_name, deployment_id)?;
+    client.activate(&app_name, deployment_id, None)?;
 
     // Capture the URL we'll print BEFORE `state` is moved into the save
     // block below. The save only mutates `deployment_id`, so the URL we
@@ -146,19 +146,10 @@ fn url_to_print(state: Option<&State>, app_name: &str) -> Option<String> {
 
 /// Resolve the app name to use for the activate path.
 ///
-/// Precedence: non-empty positional `app` wins; otherwise read from `state.json`;
-/// otherwise error. An empty string in state is treated as missing.
+/// Delegates to `state_io::resolve_app_name` so the precedence rule
+/// stays in one place. An empty string in state is treated as missing.
 fn resolve_app_name(app: &str, state: Option<&State>) -> Result<String> {
-    if !app.is_empty() {
-        return Ok(app.to_string());
-    }
-    match state {
-        Some(s) if !s.app_name.is_empty() => Ok(s.app_name.clone()),
-        _ => anyhow::bail!(
-            "edge deploy --id requires an app name; pass it positionally \
-             or run from a directory with .edge/state.json"
-        ),
-    }
+    super::state_io::resolve_app_name("edge deploy --id", app, state)
 }
 
 #[cfg(not(feature = "network"))]
@@ -186,47 +177,6 @@ mod tests {
             // state.json live in state/mod.rs.
             regions: vec![],
         }
-    }
-
-    #[test]
-    fn resolve_positional_wins_over_empty() {
-        let got = resolve_app_name("myapp", None).unwrap();
-        assert_eq!(got, "myapp");
-    }
-
-    #[test]
-    fn resolve_falls_back_to_state_when_positional_empty() {
-        let s = state_with("from-state");
-        let got = resolve_app_name("", Some(&s)).unwrap();
-        assert_eq!(got, "from-state");
-    }
-
-    #[test]
-    fn resolve_positional_wins_over_state() {
-        let s = state_with("from-state");
-        let got = resolve_app_name("positional", Some(&s)).unwrap();
-        assert_eq!(got, "positional");
-    }
-
-    #[test]
-    fn resolve_errors_when_no_inputs() {
-        let err = resolve_app_name("", None).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("requires an app name"),
-            "expected 'requires an app name' in error, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn resolve_treats_empty_state_as_missing() {
-        let s = state_with("");
-        let err = resolve_app_name("", Some(&s)).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("requires an app name"),
-            "expected 'requires an app name' in error, got: {msg}"
-        );
     }
 
     #[test]

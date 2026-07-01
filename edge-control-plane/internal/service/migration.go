@@ -3,11 +3,12 @@ package service
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/google/uuid"
 )
 
@@ -42,11 +44,31 @@ var ErrRustcFailed = fmt.Errorf("rustc compilation failed")
 // DeploymentRepoInterface abstracts deployment creation for testing.
 type DeploymentRepoInterface interface {
 	Create(ctx context.Context, d *domain.Deployment) error
+	// DeleteByID removes a deployment row by ID. Idempotent on missing
+	// row. Used as the compensating write when the artifact save
+	// fails after the row was inserted.
+	DeleteByID(ctx context.Context, id string) error
 }
 
 // ArtifactStoreInterface abstracts wasm artifact storage for testing.
+// Mirrors storage.ArtifactStore (ctx-aware) so rollbackArtifactSave
+// and test mocks can pass through to the production type without a
+// signature adapter.
 type ArtifactStoreInterface interface {
-	Save(tenantID, appName, deploymentID string, r io.Reader) error
+	Save(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) error
+	// SaveAndHash streams the artifact to disk and returns its SHA-256
+	// in a single io.Copy pass (no intermediate buffer). Hash + write
+	// are concurrent via io.MultiWriter; the final path either
+	// contains the full artifact (with a verified hash) or doesn't
+	// exist (atomic temp-rename). Prefer this over Save when the
+	// caller needs the hash; the older Save was retained for callers
+	// that don't (and for the migration pre-compile path that
+	// already has the bytes hashed separately).
+	SaveAndHash(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) ([]byte, error)
+	// Delete removes an artifact. Idempotent on missing file. Used as
+	// the compensating write when the row insert fails after the
+	// artifact was written.
+	Delete(ctx context.Context, tenantID, appName, deploymentID string) error
 }
 
 // transformEnvelope mirrors edge-migrate-lib's `TransformOutput`.
@@ -63,7 +85,7 @@ type transformEnvelope struct {
 // MigrationService transforms POSIX C source to WASI and compiles it to wasm.
 type MigrationService struct {
 	deploymentRepo  DeploymentRepoInterface
-	artifactStore   ArtifactStoreInterface
+	artifactStore   storage.ArtifactStore
 	edgeMigratePath string
 	wasiSdkPath     string
 	// rustcPath is the absolute path to a rustc binary capable of
@@ -74,7 +96,7 @@ type MigrationService struct {
 // NewMigrationService creates a MigrationService.
 func NewMigrationService(
 	deploymentRepo DeploymentRepoInterface,
-	artifactStore ArtifactStoreInterface,
+	artifactStore storage.ArtifactStore,
 	edgeMigratePath, wasiSdkPath, rustcPath string,
 ) *MigrationService {
 	return &MigrationService{
@@ -136,12 +158,20 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 		return nil, fmt.Errorf("creating temp source file: %w", err)
 	}
 	tmpSrcPath := tmpSrc.Name()
-	defer os.Remove(tmpSrcPath)
+	defer func() {
+		if removeErr := os.Remove(tmpSrcPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			log.Printf("migration service: failed to remove temp file: %v", removeErr)
+		}
+	}()
 	if _, err := tmpSrc.WriteString(source); err != nil {
-		tmpSrc.Close()
+		if closeErr := tmpSrc.Close(); closeErr != nil {
+			log.Printf("migration service: failed to close temp file: %v", closeErr)
+		}
 		return nil, fmt.Errorf("writing temp source: %w", err)
 	}
-	tmpSrc.Close()
+	if err := tmpSrc.Close(); err != nil {
+		log.Printf("migration service: failed to close temp file: %v", err)
+	}
 
 	// Run `edge-migrate --language <lang> --transform <path> --format json`.
 	// The binary emits a `transformEnvelope` with the structured report and
@@ -175,7 +205,6 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 	var envelope transformEnvelope
 	var parseErr error
 	_ = json.Unmarshal(edgeMigOut.Bytes(), &envelope) // soft-parse; fall through to heuristic on error
-	parseErr = nil
 	if len(edgeMigOut.Bytes()) > 0 && len(edgeMigOut.Bytes()) < 4 {
 		parseErr = fmt.Errorf("edge-migrate output too short to be a valid envelope")
 	} else if !bytes.HasPrefix(bytes.TrimSpace(edgeMigOut.Bytes()), []byte("{")) {
@@ -241,8 +270,14 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 		return nil, fmt.Errorf("creating temp wasm file: %w", err)
 	}
 	tmpWasmPath := tmpWasm.Name()
-	tmpWasm.Close()
-	defer os.Remove(tmpWasmPath)
+	if err := tmpWasm.Close(); err != nil {
+		log.Printf("migration service: failed to close temp Wasm file: %v", err)
+	}
+	defer func() {
+		if removeErr := os.Remove(tmpWasmPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			log.Printf("migration service: failed to remove temp Wasm file: %v", removeErr)
+		}
+	}()
 
 	var compileErrMsg string
 	var compileSentinel error
@@ -255,12 +290,20 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 			return nil, fmt.Errorf("creating temp rs file: %w", err)
 		}
 		tmpRsPath := tmpRs.Name()
-		defer os.Remove(tmpRsPath)
+		defer func() {
+			if removeErr := os.Remove(tmpRsPath); removeErr != nil && !os.IsNotExist(removeErr) {
+				log.Printf("migration service: failed to remove temp rs file: %v", removeErr)
+			}
+		}()
 		if _, err := tmpRs.WriteString(transformed); err != nil {
-			tmpRs.Close()
+			if closeErr := tmpRs.Close(); closeErr != nil {
+				log.Printf("migration service: failed to close temp rs file: %v", closeErr)
+			}
 			return nil, fmt.Errorf("writing temp rs: %w", err)
 		}
-		tmpRs.Close()
+		if err := tmpRs.Close(); err != nil {
+			log.Printf("migration service: failed to close temp rs file: %v", err)
+		}
 
 		rustcCmd := exec.CommandContext(ctx, s.rustcPath,
 			"--target", "wasm32-wasip2",
@@ -292,8 +335,11 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 	if compileErrMsg != "" {
 		// Build failure report from envelope's structured Report (HEAD)
 		// when available; fall back to a fresh struct otherwise.
+		// Status is Failed: the analyzer ran fine, the toolchain refused
+		// to compile the transformed source. Partial is reserved for the
+		// analyzer-driven case (some patterns need manual review).
 		report := envelope.Report
-		report.Status = domain.MigrationStatusPartial
+		report.Status = domain.MigrationStatusFailed
 		report.WasmStored = false
 		report.AppName = appName
 		report.DeploymentID = nil
@@ -307,31 +353,13 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 		return &report, compileSentinel
 	}
 
-	// Read wasm bytes
-	wasmBytes, err := os.ReadFile(tmpWasmPath)
+	// Stat the compiled wasm for the size cap. Avoids buffering the
+	// full artifact (up to MaxArtifactSize = 100 MiB) into RAM just
+	// to read its length — the streaming SaveAndHash below hashes
+	// and writes the file in a single pass.
+	info, err := os.Stat(tmpWasmPath)
 	if err != nil {
-		return nil, fmt.Errorf("reading compiled wasm: %w", err)
-	}
-
-	// Reject output that isn't actually wasm. A misconfigured
-	// wasi-sdk or a non-wasm target will produce a file that passes the
-	// compiler but fails on the worker — surface that here so the
-	// migration report reflects a clear failure rather than silently
-	// storing a broken artifact.
-	if !validateWasm(wasmBytes) {
-		report := envelope.Report
-		report.Status = domain.MigrationStatusFailed
-		report.WasmStored = false
-		report.AppName = appName
-		report.DeploymentID = nil
-		report.Errors = []domain.ErrorInfo{{
-			Line:    0,
-			Message: "compiled output is not a valid wasm binary (missing magic bytes)",
-		}}
-		if len(report.PatternsTransformed) == 0 {
-			report.PatternsTransformed = patternsTransformed
-		}
-		return &report, fmt.Errorf("compiled output is not a valid wasm binary")
+		return nil, fmt.Errorf("stat compiled wasm: %w", err)
 	}
 
 	// Enforce MaxArtifactSize. Catches accidental huge builds (e.g.,
@@ -339,7 +367,7 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 	// hit the database or filesystem. Closes the pre-existing gap on
 	// the single-file `Migrate` path (M2.C8) — MigrateTree enforces
 	// the same cap separately.
-	if int64(len(wasmBytes)) > MaxArtifactSize {
+	if info.Size() > MaxArtifactSize {
 		report := envelope.Report
 		report.Status = domain.MigrationStatusFailed
 		report.WasmStored = false
@@ -359,27 +387,84 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 		return &report, ErrMigrationFailed
 	}
 
-	// Generate deployment ID and hash
-	depID := "d_" + uuid.New().String()
-	hash := sha256.Sum256(wasmBytes)
+	// Reject output that isn't actually wasm. A misconfigured
+	// wasi-sdk or a non-wasm target will produce a file that passes the
+	// compiler but fails on the worker — surface that here so the
+	// migration report reflects a clear failure rather than silently
+	// storing a broken artifact. Peek the magic bytes from the file
+	// directly (4 bytes is enough; the spec's 8-byte header is just
+	// magic + version, and a bad magic always means a bad file).
+	magicFile, err := os.Open(tmpWasmPath)
+	if err != nil {
+		return nil, fmt.Errorf("opening compiled wasm: %w", err)
+	}
+	var magic [4]byte
+	if _, err := io.ReadFull(magicFile, magic[:]); err != nil {
+		_ = magicFile.Close()
+		return nil, fmt.Errorf("reading wasm magic: %w", err)
+	}
+	if !bytes.HasPrefix(magic[:], []byte{0x00, 0x61, 0x73, 0x6d}) {
+		_ = magicFile.Close()
+		report := envelope.Report
+		report.Status = domain.MigrationStatusFailed
+		report.WasmStored = false
+		report.AppName = appName
+		report.DeploymentID = nil
+		report.Errors = []domain.ErrorInfo{{
+			Line:    0,
+			Message: "compiled output is not a valid wasm binary (missing magic bytes)",
+		}}
+		if len(report.PatternsTransformed) == 0 {
+			report.PatternsTransformed = patternsTransformed
+		}
+		return &report, fmt.Errorf("compiled output is not a valid wasm binary")
+	}
+	// Rewind so SaveAndHash below reads from byte 0, not byte 4.
+	if _, err := magicFile.Seek(0, io.SeekStart); err != nil {
+		_ = magicFile.Close()
+		return nil, fmt.Errorf("rewinding compiled wasm: %w", err)
+	}
 
-	// Create deployment DB record
+	// Generate deployment ID
+	depID := "d_" + uuid.New().String()
+
+	// Create deployment DB record. Hash is filled in after SaveAndHash
+	// returns — the hash is computed in the same io.Copy pass that
+	// writes the artifact to disk.
 	deployment := &domain.Deployment{
 		ID:        depID,
 		TenantID:  tenantID,
 		AppName:   appName,
 		Status:    domain.StatusMigrated,
-		Hash:      hex.EncodeToString(hash[:]),
+		Hash:      "",
 		CreatedAt: time.Now(),
 	}
 	if err := s.deploymentRepo.Create(ctx, deployment); err != nil {
+		_ = magicFile.Close()
 		return nil, fmt.Errorf("creating deployment record: %w", err)
 	}
 
-	// Store wasm artifact
-	if err := s.artifactStore.Save(tenantID, appName, depID, bytes.NewReader(wasmBytes)); err != nil {
-		return nil, fmt.Errorf("saving wasm artifact: %w", err)
+	// Stream the artifact to disk and compute the SHA-256 in a single
+	// pass. SaveAndHash is atomic on disk (temp-rename), so a failed
+	// read mid-stream leaves no partial blob at the final path. We
+	// inline the rollback (DeleteByID + Delete) rather than call
+	// rollbackArtifactSave because the production s.artifactStore is
+	// the ctx-aware storage.ArtifactStore, while rollbackArtifactSave
+	// takes the non-ctx service.ArtifactStoreInterface. The deployment
+	// row is rolled back by the caller's tx (or compensated in the
+	// no-tx path).
+	hash, saveErr := s.artifactStore.SaveAndHash(ctx, tenantID, appName, depID, magicFile)
+	_ = magicFile.Close()
+	if saveErr != nil {
+		if delErr := s.deploymentRepo.DeleteByID(ctx, depID); delErr != nil {
+			log.Printf("rollback DeleteByID failed after artifact save error: deployment_id=%s error=%v", depID, delErr)
+		}
+		if delErr := s.artifactStore.Delete(ctx, tenantID, appName, depID); delErr != nil && !errors.Is(delErr, os.ErrNotExist) {
+			log.Printf("rollback artifact.Delete failed after artifact save error: deployment_id=%s error=%v", depID, delErr)
+		}
+		return nil, fmt.Errorf("%w: saving artifact: %w", ErrMigrationFailed, saveErr)
 	}
+	deployment.Hash = hex.EncodeToString(hash)
 
 	// Build success report from envelope's structured Report (HEAD),
 	// overlaying fields the envelope doesn't carry (wasm_stored,
@@ -501,6 +586,164 @@ func detectTransformedPatternsRust(wasiRs string) []domain.PatternInfo {
 	return patterns
 }
 
+// detectManualReviewPatternsC scans the transformed WASI source for
+// POSIX call tokens that the transformer would have rewritten had a
+// WASI equivalent existed. Any token still present means the
+// transformer left the call verbatim → manual review.
+//
+// This is the manual-review counterpart to detectTransformedPatterns.
+// When --analyze-json fails, the fallback runs both: the auto list
+// and this list, then merges. The Rust analyzer's structured output
+// remains the source of truth.
+//
+// The set of tokens mirrors the Rust analyzer's NotTransformable C
+// variants (PosixPattern::transformability() in
+// edge-migrate/edge-migrate-lib/src/patterns.rs:384-426). For the
+// flag-based variants (O_NONBLOCK, SOCK_RAW) we scan for the flag
+// tokens anywhere — false positives in plain C code are unlikely
+// since these are rare identifiers. A future improvement could scope
+// to a socket() arg list specifically.
+//
+// Limitations: does not skip comments or string literals (see
+// posixCallPresent). The transformer itself emits only
+// "// WASI: two-phase <verb>" comments without "(", so false
+// positives require user-authored documentation comments containing
+// POSIX call signatures — narrow edge case, deferred.
+func detectManualReviewPatternsC(wasiSource string) []domain.PatternInfo {
+	checks := []struct {
+		token   string
+		pattern string
+		reason  string
+	}{
+		{"fork(", "Fork", "no WASI equivalent — fork has no WASI equivalent"},
+		{"vfork(", "Fork", "no WASI equivalent — fork has no WASI equivalent"},
+		{"poll(", "Poll", "no WASI equivalent — poll has no WASI equivalent"},
+		{"select(", "Select", "no WASI equivalent — select has no WASI equivalent"},
+		{"exec(", "Exec", "no WASI equivalent — exec has no WASI equivalent"},
+		{"execve(", "Exec", "no WASI equivalent — exec has no WASI equivalent"},
+		{"execl(", "Exec", "no WASI equivalent — exec has no WASI equivalent"},
+		{"execvp(", "Exec", "no WASI equivalent — exec has no WASI equivalent"},
+		{"socketpair(", "SocketPair", "no WASI equivalent — socketpair has no WASI equivalent"},
+		{"shutdown(", "Shutdown", "no WASI equivalent — shutdown not in wasi-sockets"},
+		{"accept(", "Accept", "TcpListener::accept() — not transformable in MVP (was: poll loop wrapper; #128)"},
+		{"accept4(", "Accept", "TcpListener::accept() — not transformable in MVP (was: poll loop wrapper; #128)"},
+		{"gethostbyname(", "GetHostByName", "no WASI equivalent — gethostbyname has no WASI equivalent"},
+		{"getaddrinfo(", "GetHostByName", "no WASI equivalent — getaddrinfo has no WASI equivalent"},
+		{"gethostbyaddr(", "GetHostByName", "no WASI equivalent — gethostbyaddr has no WASI equivalent"},
+		{"O_NONBLOCK", "NonBlocking", "no WASI equivalent — O_NONBLOCK not in wasi-sockets"},
+		{"SOCK_RAW", "SockRaw", "no WASI equivalent — SOCK_RAW not in wasi-sockets"},
+	}
+	seen := make(map[string]bool)
+	var patterns []domain.PatternInfo
+	for _, c := range checks {
+		if seen[c.pattern] {
+			continue
+		}
+		if posixCallPresent(wasiSource, c.token) {
+			seen[c.pattern] = true
+			patterns = append(patterns, domain.PatternInfo{
+				Pattern:          c.pattern,
+				Snippet:          c.token,
+				WasiEquivalent:   c.reason,
+				Transformability: domain.TransformabilityNotTransformable,
+			})
+		}
+	}
+	return patterns
+}
+
+// detectManualReviewPatternsRust is the Rust counterpart. It scans
+// the transformed Rust source for NotTransformable Rust pattern
+// markers (RustPattern::transformability() in
+// edge-migrate/edge-migrate-lib/src/patterns.rs:460-474).
+//
+//   - ".accept(" on a TcpListener → TcpAccept. The dot precedes the
+//     call; posixCallPresent's word-boundary check accepts "." as a
+//     non-ident separator (it's not in [a-zA-Z0-9_]), so
+//     posixCallPresent(wasiSource, ".accept(") correctly matches
+//     method-call form and rejects identifier-suffix forms like
+//     "myaccept(".
+//   - "UdpSocket::connect" → UdpConnect. The transformer rewrites
+//     TcpStream::connect to wasi_socket_tcp_start_connect, so any
+//     ".connect(" left in the transformed source is by elimination
+//     non-rewriteable. We match the literal "UdpSocket::connect"
+//     rather than ".connect(" to avoid false positives on
+//     other-method accept() etc.
+//   - "std::process::exit" → ProcessExit.
+func detectManualReviewPatternsRust(wasiSource string) []domain.PatternInfo {
+	checks := []struct {
+		token   string
+		pattern string
+		reason  string
+	}{
+		{".accept(", "TcpAccept", "TcpListener::accept() — not transformable in MVP (#128)"},
+		{"UdpSocket::connect", "UdpConnect", "no WASI equivalent — UdpSocket::connect not in wasi-sockets"},
+		{"std::process::exit", "ProcessExit", "no WASI equivalent — Wasm has no process model"},
+	}
+	var patterns []domain.PatternInfo
+	seen := make(map[string]bool)
+	for _, c := range checks {
+		if seen[c.pattern] {
+			continue
+		}
+		if posixCallPresent(wasiSource, c.token) {
+			seen[c.pattern] = true
+			patterns = append(patterns, domain.PatternInfo{
+				Pattern:          c.pattern,
+				Snippet:          c.token,
+				WasiEquivalent:   c.reason,
+				Transformability: domain.TransformabilityNotTransformable,
+			})
+		}
+	}
+	return patterns
+}
+
+// posixCallPresent reports whether `callToken` (e.g. "bind(", "fork(",
+// ".accept(") appears in source as an actual call. The naive
+// strings.Contains check matches "bind(" inside
+// "wasi_socket_tcp_start_bind(", producing false positives for
+// transformed source. The word-boundary check ensures we only match
+// the real call form.
+//
+// The check is asymmetric:
+//   - If callToken[0] is an identifier char (e.g. 'b' in "bind("),
+//     the preceding byte must NOT be an identifier char — otherwise
+//     it's a longer identifier like "mybind(" or "wasi_*bind(".
+//   - If callToken[0] is a non-identifier char (e.g. '.' in
+//     ".accept(" for Rust method calls), the leading non-ident char
+//     already breaks any identifier continuation, so any preceding
+//     byte is fine.
+func posixCallPresent(source, callToken string) bool {
+	firstIsIdent := isIdentChar(callToken[0])
+	for i := 0; i+len(callToken) <= len(source); {
+		j := strings.Index(source[i:], callToken)
+		if j < 0 {
+			return false
+		}
+		idx := i + j
+		if firstIsIdent {
+			if idx == 0 || !isIdentChar(source[idx-1]) {
+				return true
+			}
+		} else {
+			return true
+		}
+		i = idx + 1
+	}
+	return false
+}
+
+func isIdentChar(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9') || b == '_'
+}
+
+// posixSnippetForPattern removed: its work is now done by
+// detectManualReviewPatternsC / detectManualReviewPatternsRust, which
+// scan the transformed WASI source directly for surviving POSIX/Rust
+// call tokens instead of diffing against heuristic-detected patterns.
+
 // MigrateTree analyzes + transforms every source file in `entries`
 // together and compiles them into a single wasm binary. M2.C9
 // (initial C path); M3.C7 added Rust.
@@ -513,7 +756,7 @@ func detectTransformedPatternsRust(wasiRs string) []domain.PatternInfo {
 //     `FileReport.patterns_detected` / `transformations` /
 //     `manual_review` and `preprocessor`.
 //
-// If `--analyze --json` fails (older edge-migrate binary), the
+// If `--analyze-json` fails (older edge-migrate binary), the
 // service falls back to a string-scan heuristic on the transformed
 // source: `detectTransformedPatterns` (C) or
 // `detectTransformedPatternsRust` (Rust). A `// TODO` below flags
@@ -562,7 +805,11 @@ func (s *MigrationService) MigrateTree(
 	if err != nil {
 		return nil, fmt.Errorf("creating temp dir: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() {
+		if removeErr := os.RemoveAll(tmpDir); removeErr != nil {
+			log.Printf("migration service: failed to remove temp dir: %v", removeErr)
+		}
+	}()
 
 	// Write each entry to <tmpDir>/<path>. Reject path traversal
 	// (defense-in-depth; handler also validates).
@@ -637,7 +884,7 @@ func (s *MigrationService) MigrateTree(
 		}
 		wf.wasiCPath = wasiCPath
 
-		// 2) `edge-migrate --analyze --json <path>` → structured report.
+		// 2) `edge-migrate --analyze-json <path>` → structured report.
 		// On failure (older binary), fall back to a heuristic that's
 		// language-aware: C → detectTransformedPatterns, Rust →
 		// detectTransformedPatternsRust.
@@ -659,19 +906,26 @@ func (s *MigrationService) MigrateTree(
 		// auto. The analyzer's structured output is the source of
 		// truth.
 		if !analyzeOK {
-			var patterns []domain.PatternInfo
+			var transformed, manualReview []domain.PatternInfo
 			if language == "rust" {
-				patterns = detectTransformedPatternsRust(wasiSource)
+				transformed = detectTransformedPatternsRust(wasiSource)
+				manualReview = detectManualReviewPatternsRust(wasiSource)
 			} else {
-				patterns = detectTransformedPatterns(wasiSource)
+				transformed = detectTransformedPatterns(wasiSource)
+				manualReview = detectManualReviewPatternsC(wasiSource)
 			}
+			// PatternsDetected is the union (transformed ∪ manualReview)
+			// so the tenant sees every detected pattern; status is
+			// classified from the union so a NotTransformable-only file
+			// surfaces as Failed, matching the Rust analyzer's convention.
+			combined := append(transformed, manualReview...)
 			single = domain.MigrationReport{
-				Status:               classifyFromPatterns(patterns),
+				Status:               classifyFromPatterns(combined),
 				WasmStored:           false,
 				AppName:              appName,
-				PatternsDetected:     patterns,
-				PatternsTransformed:  patterns,
-				PatternsManualReview: nil,
+				PatternsDetected:     combined,
+				PatternsTransformed:  transformed,
+				PatternsManualReview: manualReview,
 				Errors:               nil,
 			}
 		}
@@ -721,8 +975,11 @@ func (s *MigrationService) MigrateTree(
 		}
 	}
 	if anyTransformFailed {
+		// Status is Failed: at least one file's transform subprocess died,
+		// so no wasm is produced. Partial is reserved for analyzer-driven
+		// classifications where the toolchain actually shipped an artifact.
 		return &domain.TreeMigrationReport{
-			Status:            status,
+			Status:            domain.MigrationStatusFailed,
 			WasmStored:        false,
 			AppName:           appName,
 			Files:             files,
@@ -742,8 +999,14 @@ func (s *MigrationService) MigrateTree(
 		return nil, fmt.Errorf("creating temp wasm: %w", err)
 	}
 	tmpWasmPath := tmpWasm.Name()
-	tmpWasm.Close()
-	defer os.Remove(tmpWasmPath)
+	if err := tmpWasm.Close(); err != nil {
+		log.Printf("migration service: failed to close temp wasm: %v", err)
+	}
+	defer func() {
+		if removeErr := os.Remove(tmpWasmPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			log.Printf("migration service: failed to remove temp wasm: %v", removeErr)
+		}
+	}()
 
 	var compileErrMsg string
 	switch language {
@@ -788,8 +1051,12 @@ func (s *MigrationService) MigrateTree(
 	}
 
 	if compileErrMsg != "" {
+		// Status is Failed: the toolchain refused to compile. Partial
+		// is reserved for analyzer-driven classifications (some files
+		// need manual review); here every file's analyzer-side result
+		// is moot because the resulting wasm is unrunnable.
 		return &domain.TreeMigrationReport{
-			Status:            status,
+			Status:            domain.MigrationStatusFailed,
 			WasmStored:        false,
 			AppName:           appName,
 			Files:             files,
@@ -803,14 +1070,17 @@ func (s *MigrationService) MigrateTree(
 		}, ErrMigrateTreeFailed
 	}
 
-	// Read + size-check the wasm.
-	wasmBytes, err := os.ReadFile(tmpWasmPath)
+	// Stat the compiled wasm for the size cap. Avoids buffering the
+	// full artifact (up to MaxArtifactSize = 100 MiB) into RAM just
+	// to read its length — the streaming SaveAndHash below hashes
+	// and writes the file in a single pass.
+	info, err := os.Stat(tmpWasmPath)
 	if err != nil {
-		return nil, fmt.Errorf("reading compiled wasm: %w", err)
+		return nil, fmt.Errorf("stat compiled wasm: %w", err)
 	}
-	if int64(len(wasmBytes)) > MaxArtifactSize {
+	if info.Size() > MaxArtifactSize {
 		return &domain.TreeMigrationReport{
-			Status:            status,
+			Status:            domain.MigrationStatusFailed,
 			WasmStored:        false,
 			AppName:           appName,
 			Files:             files,
@@ -823,9 +1093,26 @@ func (s *MigrationService) MigrateTree(
 			}},
 		}, ErrMigrateTreeFailed
 	}
-	if !validateWasm(wasmBytes) {
+	// Peek the wasm magic bytes from the file directly (4 bytes is
+	// enough; the spec's 8-byte header is just magic + version, and
+	// a bad magic always means a bad file). Avoids a full
+	// os.ReadFile on a 100 MiB blob.
+	magicFile, err := os.Open(tmpWasmPath)
+	if err != nil {
+		return nil, fmt.Errorf("opening compiled wasm: %w", err)
+	}
+	var magic [4]byte
+	if _, err := io.ReadFull(magicFile, magic[:]); err != nil {
+		_ = magicFile.Close()
+		return nil, fmt.Errorf("reading wasm magic: %w", err)
+	}
+	if !bytes.HasPrefix(magic[:], []byte{0x00, 0x61, 0x73, 0x6d}) {
+		_ = magicFile.Close()
+		// Same Failed semantics as the compile-failure branch above —
+		// the toolchain emitted bytes that don't have the wasm magic;
+		// per-file analyzer status is irrelevant.
 		return &domain.TreeMigrationReport{
-			Status:            status,
+			Status:            domain.MigrationStatusFailed,
 			WasmStored:        false,
 			AppName:           appName,
 			Files:             files,
@@ -838,24 +1125,45 @@ func (s *MigrationService) MigrateTree(
 			}},
 		}, ErrMigrateTreeFailed
 	}
+	// Rewind so SaveAndHash below reads from byte 0, not byte 4.
+	if _, err := magicFile.Seek(0, io.SeekStart); err != nil {
+		_ = magicFile.Close()
+		return nil, fmt.Errorf("rewinding compiled wasm: %w", err)
+	}
 
 	// Persist: deployment row + artifact blob.
 	depID := "d_" + uuid.New().String()
-	hash := sha256.Sum256(wasmBytes)
 	deployment := &domain.Deployment{
 		ID:        depID,
 		TenantID:  tenantID,
 		AppName:   appName,
 		Status:    "migrated",
-		Hash:      hex.EncodeToString(hash[:]),
+		Hash:      "",
 		CreatedAt: time.Now(),
 	}
 	if err := s.deploymentRepo.Create(ctx, deployment); err != nil {
+		_ = magicFile.Close()
 		return nil, fmt.Errorf("creating deployment: %w", err)
 	}
-	if err := s.artifactStore.Save(tenantID, appName, depID, bytes.NewReader(wasmBytes)); err != nil {
-		return nil, fmt.Errorf("saving artifact: %w", err)
+	// Stream the artifact to disk and compute the SHA-256 in a single
+	// pass. See the rollback comment in MigrationService.Migrate for
+	// why the blob is cleaned up here. We inline the rollback
+	// (DeleteByID + Delete) rather than call rollbackArtifactSave
+	// because the production s.artifactStore is the ctx-aware
+	// storage.ArtifactStore, while rollbackArtifactSave takes the
+	// non-ctx service.ArtifactStoreInterface.
+	hash, saveErr := s.artifactStore.SaveAndHash(ctx, tenantID, appName, depID, magicFile)
+	_ = magicFile.Close()
+	if saveErr != nil {
+		if delErr := s.deploymentRepo.DeleteByID(ctx, depID); delErr != nil {
+			log.Printf("rollback DeleteByID failed after artifact save error: deployment_id=%s error=%v", depID, delErr)
+		}
+		if delErr := s.artifactStore.Delete(ctx, tenantID, appName, depID); delErr != nil && !errors.Is(delErr, os.ErrNotExist) {
+			log.Printf("rollback artifact.Delete failed after artifact save error: deployment_id=%s error=%v", depID, delErr)
+		}
+		return nil, fmt.Errorf("%w: saving artifact: %w", ErrMigrateTreeFailed, saveErr)
 	}
+	deployment.Hash = hex.EncodeToString(hash)
 
 	return &domain.TreeMigrationReport{
 		Status:            status,

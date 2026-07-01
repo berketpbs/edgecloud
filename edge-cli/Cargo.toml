@@ -3,6 +3,7 @@ name = "edge-cli"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
+publish = false
 description = "edgeCloud developer CLI toolchain"
 
 [dependencies]
@@ -13,16 +14,21 @@ serde_json = "1.0"
 toml = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart", "blocking"], optional = true }
 tokio = { version = "1.45", features = ["full"], optional = true }
-indicatif = "0.17"
 console = "0.15"
 open = "5.0"
 notify = "6.1"
 regex = "1.10"
-tree-sitter = "0.22"
-tree-sitter-c = "0.21"
-syn = "2.0"
 walkdir = "2.5"
 dirs = "5.0"
+# Used by `edge logs --follow` to install a SIGINT handler so the
+# polling loop exits cleanly on Ctrl-C. Pulled in unconditionally
+# rather than feature-gated so the binary shape matches what the
+# docs / smoke tests expect.
+ctrlc = "3"
+# Reads the API key from /dev/tty with terminal echo disabled when
+# `edge auth login --no-echo` is used (issue #108). Default login
+# path (stdin paste, echo on) is preserved for CI/pipe ergonomics.
+rpassword = "7"
 edge-config = { path = "../edge-config" }
 
 [features]

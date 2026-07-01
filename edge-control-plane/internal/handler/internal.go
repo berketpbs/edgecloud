@@ -1,31 +1,150 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 )
 
-// InternalHandler handles internal worker-facing endpoints.
-type InternalHandler struct {
-	deploymentSvc *service.DeploymentService
-	workerSvc     *service.WorkerService
-	logEntryRepo  logEntryRepo
+// InternalDomainServiceInterface is the slice of *service.DomainService
+// that InternalHandler needs (issue #83). Distinct from the
+// tenant-facing `DomainServiceInterface` in `domain.go`; the two
+// interfaces have no methods in common. Defined as an interface so
+// handler tests can inject a mock without spinning up a real DB
+// (matching the pattern used by DeploymentServiceInterface /
+// WorkerServiceInterface in other handler files).
+type InternalDomainServiceInterface interface {
+	ListAllDomains(ctx context.Context) ([]domain.Domain, error)
+	IsTlsAllowed(ctx context.Context, fqdn string) (bool, error)
+	UpdateStatus(ctx context.Context, id string, status domain.DomainStatus, lastError *string) error
 }
 
-func NewInternalHandler(deploymentSvc *service.DeploymentService, workerSvc *service.WorkerService, logEntryRepo logEntryRepo) *InternalHandler {
+// Compile-time check that the service still satisfies the interface.
+// The error mapping for `service.ErrDomainNotFound → 404` in
+// `UpdateDomainStatus` depends on this contract; if a future refactor
+// changes the signature, the handler will fail to compile and the
+// 404 path will not silently regress to 204.
+var _ InternalDomainServiceInterface = (*service.DomainService)(nil)
+
+// InternalHandler handles internal worker-facing endpoints.
+//
+// `deploymentSvc` is held as the narrow autoRollbacker interface so
+// tests can stub AutoRollback without standing up the full
+// *service.DeploymentService (DB + NATS + publisher + artifact store).
+// Download uses two methods of the same underlying service
+// (GetDeployment, GetArtifact); these also live on the interface so
+// the production code path is unchanged. The concrete
+// *service.DeploymentService satisfies it, so the existing caller in
+// cmd/api/main.go compiles unchanged.
+//
+// `domainSvc` is nil when the binary is built without custom-domain
+// support (default-only mode) — every method that needs it returns
+// 501. `logEntryRepo` is the worker log ingest path (issue #76);
+// required by AutoRollback's audit trail and any future log-bearing
+// endpoint.
+//
+// `reconcileSvc` is the on-demand full_sync publisher used by
+// RegisterWorker (issue #53). When nil, registration does not trigger
+// a sync — the periodic timer in cmd/api/main.go will catch up
+// within RECONCILE_INTERVAL. Set via NewInternalHandler. Tests pass
+// nil so they don't have to wire a publisher.
+type InternalHandler struct {
+	deploymentSvc autoRollbacker
+	workerSvc     workerRegisterer
+	domainSvc     InternalDomainServiceInterface
+	logEntryRepo  logEntryRepo
+	reconcileSvc  syncRequester
+	// syncBuilder is the read-only side of the ReconcileService — it
+	// computes the per-region AppConfig map without publishing, so the
+	// HTTP /sync fallback endpoint (issue #53) can return the exact
+	// payload the periodic loop would publish. Tests inject a stub.
+	// nil-safe: when nil, the Sync endpoint returns 501.
+	syncBuilder syncPayloadBuilder
+}
+
+// autoRollbacker is the narrow contract InternalHandler's endpoints
+// need. Combines AutoRollback's RollbackDeployment with Download's
+// GetDeployment + GetArtifact so the production code path doesn't need
+// to switch field accessors. Mirrors the pattern in DeploymentHandler
+// (deploymentRollbacker in deployment.go).
+type autoRollbacker interface {
+	RollbackDeployment(ctx context.Context, tenantID, appName string) (string, error)
+	GetDeployment(ctx context.Context, tenantID, deploymentID string) (*domain.Deployment, error)
+	GetArtifact(ctx context.Context, tenantID, appName, deploymentID string) (io.ReadCloser, error)
+}
+
+// workerRegisterer is the narrow contract the RegisterWorker endpoint
+// needs. Holding the concrete *service.WorkerService made it
+// impossible to test the success path without standing up the full
+// worker service (DB + NATS conn + metrics aggregator). Production
+// caller (cmd/api/main.go) still passes *service.WorkerService, which
+// satisfies the interface. ListWorkers isn't covered here because no
+// other endpoint currently exercises the worker service — if a future
+// endpoint needs ListByTenant, add it to this interface.
+type workerRegisterer interface {
+	Register(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) error
+	ListByTenant(ctx context.Context, tenantID string) ([]domain.Worker, error)
+	// Get resolves a worker_id (from the URL path of /api/internal/workers/{workerID}/sync)
+	// to a *domain.Worker so the handler can scope the sync payload to
+	// that worker's (tenant, region). Issue #53.
+	Get(ctx context.Context, workerID string) (*domain.Worker, error)
+}
+
+// syncRequester is the narrow contract RegisterWorker uses to trigger
+// an on-register full_sync (issue #53). Defining it as an interface
+// (instead of taking *service.ReconcileService directly) keeps handler
+// tests mockable without standing up the full ReconcileService — the
+// only production caller is `*service.ReconcileService`, set in
+// cmd/api/main.go.
+//
+// nil means "no on-register sync" — tests pass nil, the periodic
+// timer in cmd/api/main.go is the durable safety net.
+type syncRequester interface {
+	RequestSync(ctx context.Context, tenantID, region string)
+}
+
+// syncPayloadBuilder is the read-only counterpart: it computes the
+// per-region AppConfig map without publishing, so the HTTP /sync
+// fallback endpoint (issue #53) can return the same payload the
+// periodic loop would publish. *service.ReconcileService satisfies it.
+type syncPayloadBuilder interface {
+	BuildFullSync(ctx context.Context, tenantID, region string) (map[string]nats.AppConfig, error)
+}
+
+func NewInternalHandler(
+	deploymentSvc autoRollbacker,
+	workerSvc workerRegisterer,
+	domainSvc InternalDomainServiceInterface,
+	logEntryRepo logEntryRepo,
+	reconcileSvc syncRequester,
+) *InternalHandler {
 	return &InternalHandler{
 		deploymentSvc: deploymentSvc,
 		workerSvc:     workerSvc,
+		domainSvc:     domainSvc,
 		logEntryRepo:  logEntryRepo,
+		reconcileSvc:  reconcileSvc,
 	}
+}
+
+// SetSyncBuilder wires the /sync HTTP fallback endpoint's payload
+// builder. Kept separate from NewInternalHandler because the builder
+// is optional (when nil, /sync returns 501) and adding it as a 6th
+// constructor arg would force every existing test stub to pass nil
+// in a new position.
+func (h *InternalHandler) SetSyncBuilder(b syncPayloadBuilder) {
+	h.syncBuilder = b
 }
 
 // Download serves Wasm artifacts to authenticated workers.
@@ -42,10 +161,18 @@ func (h *InternalHandler) Download(w http.ResponseWriter, r *http.Request) {
 
 	artifact, err := h.deploymentSvc.GetArtifact(r.Context(), deployment.TenantID, deployment.AppName, deployment.ID)
 	if err != nil {
+		if errors.Is(err, storage.ErrArtifactTooLarge) {
+			httperror.PayloadTooLargeCtx(w, r, "artifact exceeds maximum size")
+			return
+		}
 		httperror.NotFoundCtx(w, r, "artifact not found")
 		return
 	}
-	defer artifact.Close()
+	defer func() {
+		if err := artifact.Close(); err != nil {
+			log.Printf("Download: failed to close Wasm artifact: %v", err)
+		}
+	}()
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.WriteHeader(http.StatusOK)
@@ -83,6 +210,26 @@ func (h *InternalHandler) RegisterWorker(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
+
+	// Fire-and-forget full_sync so the worker comes up populated
+	// immediately instead of waiting up to RECONCILE_INTERVAL (issue #53).
+	// Best-effort: the periodic timer is the durable safety net, so a
+	// publish failure here is logged and dropped — the worker's next
+	// reconcile sweep (or the on-register fallback in cmd/api/main.go's
+	// process restart) catches up.
+	//
+	// We capture (tenantID, region) and use a fresh background ctx with
+	// a short deadline because r.Context() is cancelled the moment
+	// WriteHeader returns, and we don't want the publish to inherit
+	// that cancellation. NATS publishes have their own internal
+	// timeout; the 5s cap here just bounds the goroutine lifetime.
+	if h.reconcileSvc != nil {
+		go func(t, region string) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			h.reconcileSvc.RequestSync(ctx, t, region)
+		}(tenantID, req.Region)
+	}
 }
 
 // ListWorkers handles GET /api/internal/workers — list workers for the authenticated tenant.
@@ -95,7 +242,9 @@ func (h *InternalHandler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := map[string]interface{}{"workers": workers}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("ListWorkers: failed to encode response: %v", err)
+	}
 }
 
 // AutoRollbackRequest is the JSON body posted by an edge-worker when
@@ -183,7 +332,8 @@ func (h *InternalHandler) AutoRollback(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, service.ErrAutoRollbackDisabled):
 			http.Error(w, `{"error": "auto-rollback disabled for this app"}`, http.StatusPreconditionFailed)
 		case errors.Is(err, service.ErrPublishFailed):
-			http.Error(w, `{"error": "rollback committed but worker notification failed; please retry"}`, http.StatusBadGateway)
+			writePublishFailureEnvelope(w, r, err,
+				"rollback committed but worker notification failed; please retry")
 		default:
 			log.Printf("internal error: %v", err)
 			httperror.InternalErrorCtx(w, r)
@@ -193,7 +343,196 @@ func (h *InternalHandler) AutoRollback(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{
+	if err := json.NewEncoder(w).Encode(map[string]string{
 		"deployment_id": newID,
-	})
+	}); err != nil {
+		log.Printf("AutoRollback: failed to encode response: %v", err)
+	}
+}
+
+// Sync handles GET /api/internal/workers/{workerID}/sync — HTTP
+// fallback for when a worker hasn't received any NATS message on
+// edgecloud.tasks.<region> for > N seconds (the worker's own
+// watchdog decides when to call; this endpoint just answers).
+//
+// Worker-authenticated: any valid worker JWT works, BUT the URL-path
+// workerID must belong to the JWT's tenant — otherwise a worker
+// registered for tenant A could enumerate workerIDs (they follow the
+// documented `w_<region>_<n>` prefix, also visible in heartbeats)
+// and read tenant B's full app set (deployment IDs, hashes, env
+// vars, allowlists). tenant_id is derived from the JWT claim, never
+// from the URL.
+//
+// Returns the same TaskMessage payload the periodic full_sync
+// publish would emit, so the worker's existing handle_task_message
+// can apply it without any new logic. The wire type is "full_sync"
+// so the worker can log/metric it distinctly from event-driven
+// task_update messages.
+//
+// 501 when the control plane was built without the sync builder
+// wired in (tests, or an operator who explicitly disabled the
+// fallback). 404 when the workerID isn't registered OR doesn't
+// belong to the authenticated tenant (the same response in both
+// cases prevents workerID enumeration via differential responses).
+// 500 on a DB error from workerSvc.Get or syncBuilder.BuildFullSync.
+func (h *InternalHandler) Sync(w http.ResponseWriter, r *http.Request) {
+	if h.syncBuilder == nil {
+		http.Error(w, "sync fallback not enabled", http.StatusNotImplemented)
+		return
+	}
+	workerID := r.PathValue("workerID")
+	if workerID == "" {
+		http.Error(w, "worker_id path parameter required", http.StatusBadRequest)
+		return
+	}
+
+	worker, err := h.workerSvc.Get(r.Context(), workerID)
+	if err != nil {
+		log.Printf("Sync(%s): %v", workerID, err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+	if worker == nil {
+		// Don't distinguish "not registered" from "belongs to a
+		// different tenant" — both return 404 with the same body so
+		// an attacker can't enumerate workerIDs belonging to other
+		// tenants.
+		http.Error(w, `{"error": "worker not found"}`, http.StatusNotFound)
+		return
+	}
+
+	// Cross-tenant authorization check: a worker authenticated as
+	// tenant A cannot read tenant B's app set via /sync. Without
+	// this, any compromised worker JWT could enumerate other
+	// tenant workerIDs and pull deployment metadata + env vars.
+	// Same response shape as the "worker not found" branch above.
+	jwtTenantID := middleware.GetWorkerTenantID(r.Context())
+	if worker.TenantID != jwtTenantID {
+		log.Printf("Sync(%s): JWT tenant=%s != worker tenant=%s; denying",
+			workerID, jwtTenantID, worker.TenantID)
+		http.Error(w, `{"error": "worker not found"}`, http.StatusNotFound)
+		return
+	}
+
+	apps, err := h.syncBuilder.BuildFullSync(r.Context(), worker.TenantID, worker.Region)
+	if err != nil {
+		log.Printf("Sync(%s): build: %v", workerID, err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+	if apps == nil {
+		// BuildFullSync is documented to return an empty map, not nil,
+		// when there's nothing to publish. Defensively normalize so the
+		// worker's JSON deserializer never sees `"apps": null`.
+		apps = map[string]nats.AppConfig{}
+	}
+
+	payload := map[string]interface{}{
+		"type":      "full_sync",
+		"timestamp": time.Now().UTC(),
+		"tenant_id": worker.TenantID,
+		"apps":      apps,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		log.Printf("Sync(%s): encode: %v", workerID, err)
+	}
+}
+
+// ListDomains handles GET /api/internal/domains — full domain list
+// for the ingress poller. JWT-authenticated; the ingress uses a
+// `role: "ingest"` token, but we accept any valid worker JWT (the
+// data is non-tenant-scoped; only the ingress + admins ever call
+// this). Response is a flat JSON array — not paginated, because
+// domain counts per platform are small.
+//
+// 501 when the binary is built without custom-domain support.
+func (h *InternalHandler) ListDomains(w http.ResponseWriter, r *http.Request) {
+	if h.domainSvc == nil {
+		http.Error(w, "custom domains not enabled", http.StatusNotImplemented)
+		return
+	}
+	domains, err := h.domainSvc.ListAllDomains(r.Context())
+	if err != nil {
+		log.Printf("ListDomains: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(domains); err != nil {
+		log.Printf("ListDomains: failed to encode response: %v", err)
+	}
+}
+
+// TlsAllowed handles GET /api/internal/tls-allowed?fqdn=X — Caddy's
+// `on_demand.ask` callback. Returns 200 if the FQDN is registered
+// (any status — pending still authorizes the challenge), 404
+// otherwise. Body is empty in both cases; Caddy only checks the
+// status code.
+//
+// 501 when the binary is built without custom-domain support.
+func (h *InternalHandler) TlsAllowed(w http.ResponseWriter, r *http.Request) {
+	if h.domainSvc == nil {
+		http.Error(w, "custom domains not enabled", http.StatusNotImplemented)
+		return
+	}
+	fqdn := r.URL.Query().Get("fqdn")
+	if fqdn == "" {
+		http.Error(w, "fqdn query parameter required", http.StatusBadRequest)
+		return
+	}
+	allowed, err := h.domainSvc.IsTlsAllowed(r.Context(), fqdn)
+	if err != nil {
+		log.Printf("TlsAllowed(%s): %v", fqdn, err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !allowed {
+		http.Error(w, "fqdn not registered", http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// UpdateDomainStatus handles POST /api/internal/domains/{id}/status —
+// server-driven status updates. v1 stub; v2 wires this to a Caddy
+// event hook so the platform learns about renewal failures.
+//
+// JWT-authenticated; the body is `{"status": "active"|"failed",
+// "last_error": "..."}`. The 404 path is critical for the v2 webhook:
+// a Caddy event for a deleted/stale domain id must NOT be silently
+// acknowledged, or the operator's "rows in failed state" alerts
+// become wrong.
+func (h *InternalHandler) UpdateDomainStatus(w http.ResponseWriter, r *http.Request) {
+	if h.domainSvc == nil {
+		http.Error(w, "custom domains not enabled", http.StatusNotImplemented)
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, "id path parameter required", http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		Status    domain.DomainStatus `json:"status"`
+		LastError *string             `json:"last_error"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if body.Status != domain.DomainStatusActive && body.Status != domain.DomainStatusFailed {
+		http.Error(w, "status must be 'active' or 'failed'", http.StatusBadRequest)
+		return
+	}
+	if err := h.domainSvc.UpdateStatus(r.Context(), id, body.Status, body.LastError); err != nil {
+		if errors.Is(err, service.ErrDomainNotFound) {
+			http.Error(w, `{"error": "domain not found"}`, http.StatusNotFound)
+			return
+		}
+		log.Printf("UpdateDomainStatus(%s): %v", id, err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

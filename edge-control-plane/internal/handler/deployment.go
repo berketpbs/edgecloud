@@ -1,12 +1,10 @@
 package handler
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -22,6 +20,7 @@ import (
 type DeploymentHandler struct {
 	deploymentSvc *service.DeploymentService
 	workerSvc     service.AppTargetLookup
+	trafficSvc    *service.TrafficService
 	// rollbackSvc is a narrow contract for the rollback handler so the
 	// test can stub it without standing up the full *service.DeploymentService
 	// (DB + NATS + publisher + artifact store). The concrete
@@ -46,10 +45,11 @@ type deploymentActivator interface {
 	ActivateDeployment(ctx context.Context, tenantID, appName, deploymentID string) error
 }
 
-func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc service.AppTargetLookup) *DeploymentHandler {
+func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc service.AppTargetLookup, trafficSvc *service.TrafficService) *DeploymentHandler {
 	return &DeploymentHandler{
 		deploymentSvc: deploymentSvc,
 		workerSvc:     workerSvc,
+		trafficSvc:    trafficSvc,
 		// Concrete *service.DeploymentService satisfies the narrow interfaces.
 		// nil is also fine for tests that only exercise the workerSvc path
 		// (e.g. AppIngress) — those methods never touch rollbackSvc /
@@ -103,15 +103,37 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read artifact from multipart form or raw body
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		httperror.BadRequestCtx(w, r, "failed to read body")
+	// Cap the body at MaxArtifactSize. http.MaxBytesReader returns a
+	// typed *http.MaxBytesError when the cap is exceeded, which we
+	// map to 413 below. The body is now streamed directly to the
+	// service via r.Body — no io.ReadAll here. The service peeks
+	// the wasm magic bytes inside its transaction callback and
+	// hands the remaining stream to ArtifactStore.SaveAndHash,
+	// which hashes and writes in a single io.Copy pass. This drops
+	// the prior ~3× RAM amplification (handler ReadAll → service
+	// ReadAll → io.Copy) for the 100 MiB artifact case.
+	//
+	// For requests with a Content-Length header (the common case),
+	// we pre-check the advertised size and reject oversize uploads
+	// before any I/O. For chunked uploads (ContentLength == -1),
+	// MaxBytesReader fires during streaming and the service
+	// surfaces the *http.MaxBytesError, which we map to 413 below.
+	if r.ContentLength > service.MaxArtifactSize {
+		http.Error(w, `{"error":"artifact exceeds maximum size"}`, http.StatusRequestEntityTooLarge)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, service.MaxArtifactSize)
 
-	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, bytes.NewReader(body), regions, autoRollback)
+	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, r.Body, regions, autoRollback)
 	if err != nil {
+		// *http.MaxBytesError surfaces from the service's streaming
+		// reads when the body exceeds the cap (chunked uploads
+		// without a Content-Length header). Map to 413.
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			http.Error(w, `{"error":"artifact exceeds maximum size"}`, http.StatusRequestEntityTooLarge)
+			return
+		}
 		if errors.Is(err, service.ErrMaxDeploymentsQuotaExceeded) {
 			httperror.QuotaExceededCtx(w, r, "max deployments quota exceeded")
 			return
@@ -128,6 +150,14 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusBadRequest)
 			return
 		}
+		// ErrInvalidWasm is what the service returns when the
+		// 4-byte magic check inside the tx callback fails. Map to
+		// 400 (not 422 or 500) — the request body was syntactically
+		// valid but the content wasn't a wasm module.
+		if errors.Is(err, service.ErrInvalidWasm) {
+			http.Error(w, `{"error": "invalid wasm artifact: missing magic bytes"}`, http.StatusBadRequest)
+			return
+		}
 		log.Printf("internal error: %v", err)
 		httperror.InternalErrorCtx(w, r)
 		return
@@ -135,13 +165,15 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(deployResponse{
+	if err := json.NewEncoder(w).Encode(deployResponse{
 		ID:                  deployment.ID,
 		Hash:                deployment.Hash,
 		URL:                 "https://" + domain.IngressHost(tenantID, appName),
 		Regions:             domain.StringArrayTo(deployment.Regions),
 		AutoRollbackEnabled: deployment.AutoRollbackEnabled,
-	})
+	}); err != nil {
+		log.Printf("Deploy: failed to encode response: %v", err)
+	}
 }
 
 // parseRegions turns the `?regions=` query value into a deduped slice.
@@ -216,7 +248,9 @@ func (h *DeploymentHandler) GetStatus(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(deployment)
+	if err := json.NewEncoder(w).Encode(deployment); err != nil {
+		log.Printf("GetStatus: failed to encode response: %v", err)
+	}
 }
 
 func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
@@ -244,12 +278,39 @@ func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{
 		"items":  deployments,
 		"total":  total,
 		"limit":  limit,
 		"offset": offset,
-	})
+	}); err != nil {
+		log.Printf("List deployments: failed to encode response: %v", err)
+	}
+}
+
+// writePublishFailureEnvelope writes the 502 Bad Gateway response for
+// a partially-failed Activate / Rollback / AutoRollback publish. The
+// body carries the per-region breakdown so the operator can see
+// exactly which regions got the message and which are pending retry.
+//
+// Used by all three 502 sites in this file + handler/internal.go.
+// If err is not a *service.PublishError (e.g. a future regression
+// that bypasses the typed wrapper), the body falls back to an
+// empty arrays + the static error message — the 502 contract
+// holds regardless. errors.Is(err, service.ErrPublishFailed) is
+// still matched by the caller before this helper is reached, so
+// callers don't need to repeat the sentinel check.
+func writePublishFailureEnvelope(w http.ResponseWriter, r *http.Request, err error, staticMessage string) {
+	details := map[string]any{
+		"regions_published": []string{},
+		"regions_failed":    []string{},
+	}
+	var pubErr *service.PublishError
+	if errors.As(err, &pubErr) {
+		details["regions_published"] = pubErr.Published
+		details["regions_failed"] = pubErr.Failed
+	}
+	httperror.BadGatewayCtx(w, r, staticMessage, details)
 }
 
 // Activate handles POST /api/apps/{appName}/activate/{deploymentID}.
@@ -279,20 +340,79 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.activateSvc.ActivateDeployment(r.Context(), tenantID, appName, deploymentID); err != nil {
-		if errors.Is(err, service.ErrPublishFailed) {
-			http.Error(w,
-				`{"error": "activation committed but worker notification failed; please retry"}`,
-				http.StatusBadGateway)
+	weightStr := r.URL.Query().Get("weight")
+	// Omitting ?weight entirely means atomic activation (weight=100) — the
+	// legacy default. Parsing only overrides the value when the query
+	// string is non-empty, so weight=100 also covers the `?weight=100`
+	// explicit case (which is the same operation, not a canary).
+	weight := 100
+	if weightStr != "" {
+		parsed, err := strconv.Atoi(weightStr)
+		if err != nil || parsed < 0 || parsed > 100 {
+			httperror.BadRequestCtx(w, r, "weight must be an integer between 0 and 100")
 			return
 		}
+		weight = parsed
+	}
+
+	// weight == 100 (explicit or omitted): atomic activation. Goes through
+	// deploymentSvc.ActivateDeployment so active_deployments is updated and
+	// rollback / auto-rollback stability evaluation target the right row.
+	// Treats ?weight=100 as identical to omitting ?weight= entirely (the
+	// canary path is for partial weights only).
+	if weight == 100 {
+		if err := h.activateSvc.ActivateDeployment(r.Context(), tenantID, appName, deploymentID); err != nil {
+			if errors.Is(err, service.ErrPublishFailed) {
+				writePublishFailureEnvelope(w, r, err,
+					"activation committed but worker notification failed; please retry")
+				return
+			}
+			log.Printf("internal error: %v", err)
+			httperror.InternalErrorCtx(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]string{"status": "activated"}); err != nil {
+			log.Printf("Activate: failed to encode response: %v", err)
+		}
+		return
+	}
+
+	// Partial weight: canary activation. Requires an existing active
+	// deployment to act as the remainder — a canary staged against
+	// nothing is the same as a plain activation, which is what
+	// ActivateDeployment above already does. Reject with 400 rather than
+	// silently producing a single-entry split whose sum != 100 (which
+	// would 500 at ValidateSum).
+	current, err := h.deploymentSvc.GetActiveDeployment(r.Context(), tenantID, appName)
+	if err != nil {
+		log.Printf("internal error: GetActiveDeployment: %v", err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+	if current == nil {
+		httperror.BadRequestCtx(w, r, "canary activation requires an existing active deployment; activate one first")
+		return
+	}
+	if current.ID == deploymentID {
+		httperror.BadRequestCtx(w, r, "deployment is already active; pick a different deployment for the canary")
+		return
+	}
+	splits := []domain.TrafficSplitEntry{
+		{DeploymentID: deploymentID, Weight: weight},
+		{DeploymentID: current.ID, Weight: 100 - weight},
+	}
+
+	if err := h.trafficSvc.SetTraffic(r.Context(), tenantID, appName, splits); err != nil {
 		log.Printf("internal error: %v", err)
 		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "activated"})
+	if err := json.NewEncoder(w).Encode(map[string]string{"status": "traffic_set"}); err != nil {
+		log.Printf("Canary activate: failed to encode response: %v", err)
+	}
 }
 
 // Rollback handles POST /api/apps/{appName}/rollback. Swaps the active
@@ -327,9 +447,8 @@ func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, service.ErrPublishFailed) {
-			http.Error(w,
-				`{"error": "rollback committed but worker notification failed; please retry"}`,
-				http.StatusBadGateway)
+			writePublishFailureEnvelope(w, r, err,
+				"rollback committed but worker notification failed; please retry")
 			return
 		}
 		log.Printf("internal error: %v", err)
@@ -338,7 +457,9 @@ func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"deployment_id": newID})
+	if err := json.NewEncoder(w).Encode(map[string]string{"deployment_id": newID}); err != nil {
+		log.Printf("Rollback: failed to encode response: %v", err)
+	}
 }
 
 func (h *DeploymentHandler) GetActive(w http.ResponseWriter, r *http.Request) {
@@ -352,7 +473,9 @@ func (h *DeploymentHandler) GetActive(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(deployment)
+	if err := json.NewEncoder(w).Encode(deployment); err != nil {
+		log.Printf("GetActive: failed to encode response: %v", err)
+	}
 }
 
 // validateAppName writes a 400 with {"error": "invalid app name"} and
@@ -417,16 +540,18 @@ func (h *DeploymentHandler) AppIngress(w http.ResponseWriter, r *http.Request) {
 	if target == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		if err := json.NewEncoder(w).Encode(map[string]interface{}{
 			"ready":    false,
 			"app_name": appName,
 			"reason":   "no running app found for this tenant",
-		})
+		}); err != nil {
+			log.Printf("AppIngress ready false: failed to encode response: %v", err)
+		}
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{
 		"ready":       true,
 		"app_name":    target.AppName,
 		"tenant_id":   target.TenantID,
@@ -434,5 +559,7 @@ func (h *DeploymentHandler) AppIngress(w http.ResponseWriter, r *http.Request) {
 		"region":      target.Region,
 		"worker_addr": target.WorkerAddr,
 		"port":        target.Port,
-	})
+	}); err != nil {
+		log.Printf("AppIngress ready true: failed to encode response: %v", err)
+	}
 }

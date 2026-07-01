@@ -15,6 +15,7 @@ type Config struct {
 	App       AppConfig       `yaml:"app"`
 	Storage   StorageConfig   `yaml:"storage"`
 	JWT       JWTConfig       `yaml:"jwt"`
+	RateLimit RateLimitConfig `yaml:"rate_limit"`
 	Migration MigrationConfig `yaml:"migration"`
 	// Region is this control plane's own region. Used as the default
 	// `regions` list for deployments that don't explicitly opt into
@@ -25,6 +26,16 @@ type Config struct {
 	// its own region. See `service.ActivateDeployment` for the
 	// fallback path. (Issue #82, v1.)
 	Region string `yaml:"region"`
+	// InternalToken is a shared secret presented by trusted
+	// service-to-service callers (today: the edge-ingress, which
+	// fetches traffic splits to apply Caddy weights). When set, the
+	// `internalAuth` middleware requires the
+	// `X-Internal-Token: <value>` header on those endpoints. When
+	// unset, the middleware fail-closes (rejects all requests) — the
+	// ingress would then 401 and the canary split would not propagate
+	// to Caddy. Operators must set EDGE_INTERNAL_TOKEN on both the
+	// control plane and the ingress to the same value.
+	InternalToken string `yaml:"internal_token"`
 }
 
 type DatabaseConfig struct {
@@ -47,13 +58,58 @@ type AppConfig struct {
 }
 
 type StorageConfig struct {
+	// ArtifactPath is the filesystem root for FSArtifactStore and the
+	// local cache directory for RemoteArtifactStore. Required when
+	// ArtifactBackend is "" or "fs" (today's contract) or "remote".
+	// Ignored when ArtifactBackend == "s3".
 	ArtifactPath string `yaml:"artifact_path"`
+
+	// ArtifactBackend selects the artifact store implementation.
+	//   ""       → FSArtifactStore (backwards-compatible default)
+	//   "fs"     → FSArtifactStore (explicit)
+	//   "s3"     → S3ArtifactStore (PutObject/GetObject/DeleteObject)
+	//   "remote" → RemoteArtifactStore (pull-through cache from a peer CP)
+	//
+	// Validated by validateStorageConfig; an unknown value fails startup
+	// so a typo in config doesn't silently fall through to "fs".
+	ArtifactBackend string `yaml:"artifact_backend"`
+
+	// S3ArtifactStore fields. Ignored unless ArtifactBackend == "s3".
+	S3Bucket    string `yaml:"s3_bucket"`
+	S3Region    string `yaml:"s3_region"`
+	S3Endpoint  string `yaml:"s3_endpoint"`   // optional, for minio/R2/LocalStack
+	S3PathStyle bool   `yaml:"s3_path_style"` // true for minio; false for AWS
+	S3KeyPrefix string `yaml:"s3_key_prefix"` // optional, e.g. "tenants/"
+
+	// RemoteArtifactStore fields. Ignored unless ArtifactBackend == "remote".
+	//
+	// PeerControlPlaneInternalToken is the shared secret the local CP
+	// presents to the peer via X-Internal-Token. Operators MUST set this
+	// to the same value as EDGE_INTERNAL_TOKEN on the peer CP. Empty
+	// value fails startup (fail-closed — never serve an unauthenticated
+	// peer pull-through request).
+	PeerControlPlaneURL           string `yaml:"peer_control_plane_url"`
+	PeerControlPlaneInternalToken string `yaml:"peer_control_plane_internal_token"`
 }
 
 type JWTConfig struct {
 	Secret string `yaml:"secret"`
 	TTL    int    `yaml:"ttl_hours"`
 	Issuer string `yaml:"issuer"`
+}
+
+// RateLimitConfig controls per-tenant and per-IP rate limiting.
+// A zero value selects the default (200 req/s tenant, 20 req/s IP).
+// Set to negative values to disable a limiter entirely.
+type RateLimitConfig struct {
+	// TenantRate is the sustained requests-per-second per tenant.
+	TenantRate int `yaml:"tenant_rate"`
+	// TenantBurst is the maximum burst of requests per tenant.
+	TenantBurst int `yaml:"tenant_burst"`
+	// IPRate is the sustained requests-per-second per client IP.
+	IPRate int `yaml:"ip_rate"`
+	// IPBurst is the maximum burst of requests per client IP.
+	IPBurst int `yaml:"ip_burst"`
 }
 
 // DSN returns the PostgreSQL connection string.
@@ -118,6 +174,34 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("STORAGE_ARTIFACT_PATH"); v != "" {
 		cfg.Storage.ArtifactPath = v
 	}
+	if v := os.Getenv("STORAGE_ARTIFACT_BACKEND"); v != "" {
+		cfg.Storage.ArtifactBackend = v
+	}
+	if v := os.Getenv("STORAGE_S3_BUCKET"); v != "" {
+		cfg.Storage.S3Bucket = v
+	}
+	if v := os.Getenv("STORAGE_S3_REGION"); v != "" {
+		cfg.Storage.S3Region = v
+	}
+	if v := os.Getenv("STORAGE_S3_ENDPOINT"); v != "" {
+		cfg.Storage.S3Endpoint = v
+	}
+	if v := os.Getenv("STORAGE_S3_PATH_STYLE"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("STORAGE_S3_PATH_STYLE must be a valid boolean: %w", err)
+		}
+		cfg.Storage.S3PathStyle = b
+	}
+	if v := os.Getenv("STORAGE_S3_KEY_PREFIX"); v != "" {
+		cfg.Storage.S3KeyPrefix = v
+	}
+	if v := os.Getenv("STORAGE_PEER_CONTROL_PLANE_URL"); v != "" {
+		cfg.Storage.PeerControlPlaneURL = v
+	}
+	if v := os.Getenv("STORAGE_PEER_CONTROL_PLANE_INTERNAL_TOKEN"); v != "" {
+		cfg.Storage.PeerControlPlaneInternalToken = v
+	}
 	if v := os.Getenv("JWT_SECRET"); v != "" {
 		cfg.JWT.Secret = v
 	}
@@ -133,6 +217,39 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("CONTROL_PLANE_REGION"); v != "" {
 		cfg.Region = v
+	}
+	if v := os.Getenv("EDGE_INTERNAL_TOKEN"); v != "" {
+		cfg.InternalToken = v
+	}
+
+	// Override rate-limit config with env vars
+	if v := os.Getenv("RATE_LIMIT_TENANT_RATE"); v != "" {
+		rate, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("RATE_LIMIT_TENANT_RATE must be a valid integer: %w", err)
+		}
+		cfg.RateLimit.TenantRate = rate
+	}
+	if v := os.Getenv("RATE_LIMIT_TENANT_BURST"); v != "" {
+		burst, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("RATE_LIMIT_TENANT_BURST must be a valid integer: %w", err)
+		}
+		cfg.RateLimit.TenantBurst = burst
+	}
+	if v := os.Getenv("RATE_LIMIT_IP_RATE"); v != "" {
+		rate, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("RATE_LIMIT_IP_RATE must be a valid integer: %w", err)
+		}
+		cfg.RateLimit.IPRate = rate
+	}
+	if v := os.Getenv("RATE_LIMIT_IP_BURST"); v != "" {
+		burst, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("RATE_LIMIT_IP_BURST must be a valid integer: %w", err)
+		}
+		cfg.RateLimit.IPBurst = burst
 	}
 
 	// Override with migration config env vars
@@ -165,11 +282,34 @@ func Load(path string) (*Config, error) {
 		cfg.Region = "global"
 	}
 
+	// Defaults for rate-limit config. Zero means "use default";
+	// negative means "disabled" (bypass middleware entirely).
+	if cfg.RateLimit.TenantRate == 0 {
+		cfg.RateLimit.TenantRate = 200
+	}
+	if cfg.RateLimit.TenantBurst == 0 {
+		cfg.RateLimit.TenantBurst = 300
+	}
+	if cfg.RateLimit.IPRate == 0 {
+		cfg.RateLimit.IPRate = 20
+	}
+	if cfg.RateLimit.IPBurst == 0 {
+		cfg.RateLimit.IPBurst = 40
+	}
+
 	// Reject insecure JWT secrets. Operators frequently ship with the
 	// default `change-me-in-production` placeholder and forget to override
 	// it; failing startup is louder and safer than silently running with a
 	// publicly-known secret. (Audit finding #2 — also referenced by tests.)
 	if err := validateJWTSecret(cfg.JWT.Secret); err != nil {
+		return nil, err
+	}
+
+	// Validate the artifact-storage backend selection and its per-backend
+	// required fields. Run after env overrides so a STORAGE_ARTIFACT_BACKEND
+	// env var that names a backend whose required fields are missing from
+	// the YAML still fails startup with a clear message.
+	if err := validateStorageConfig(&cfg.Storage); err != nil {
 		return nil, err
 	}
 
@@ -209,6 +349,69 @@ func validateJWTSecret(s string) error {
 	}
 	if len(s) < 32 {
 		return fmt.Errorf("jwt.secret must be at least 32 bytes (got %d)", len(s))
+	}
+	return nil
+}
+
+// validArtifactBackends is the closed set of values ArtifactBackend accepts.
+// Empty ("") is handled separately — it defaults to "fs" so existing
+// deployments without an explicit selection keep working. Adding a backend
+// here also requires a constructor in internal/storage/factory.go (issue #127).
+var validArtifactBackends = map[string]struct{}{
+	"":       {},
+	"fs":     {},
+	"s3":     {},
+	"remote": {},
+}
+
+// validateStorageConfig enforces the per-backend required fields for
+// cfg.Storage. Run from Load() after env-var overrides so the values
+// reflect the final configuration.
+//
+// The rules are deliberately minimal — backend selection + presence of
+// the fields that backend's constructor requires. Anything more (e.g.
+// validating that the S3 endpoint URL parses) belongs in the backend's
+// constructor (NewS3ArtifactStore) so the same rules apply when the
+// store is constructed outside of config.Load (e.g. tests).
+//
+// The fail-closed defaults below match the backend constructors:
+//   - "fs"     → FSArtifactStore tolerates an empty ArtifactPath (the
+//     constructor just sets basePath=""); in practice operators always
+//     set it. Empty path is NOT a hard error so the migration test
+//     fixtures (which pass an empty storage block) keep working.
+//   - "s3"     → S3ArtifactStore requires S3Bucket + S3Region.
+//   - "remote" → RemoteArtifactStore requires PeerControlPlaneURL +
+//     PeerControlPlaneInternalToken + ArtifactPath. The token rule
+//     mirrors the middleware's fail-closed behavior on empty token.
+func validateStorageConfig(s *StorageConfig) error {
+	backend := s.ArtifactBackend
+	if backend == "" {
+		backend = "fs"
+	}
+	if _, ok := validArtifactBackends[backend]; !ok {
+		return fmt.Errorf(
+			"storage.artifact_backend %q is not a recognized backend (want one of: fs, s3, remote)",
+			s.ArtifactBackend,
+		)
+	}
+	switch backend {
+	case "s3":
+		if s.S3Bucket == "" {
+			return fmt.Errorf("storage.s3_bucket is required when artifact_backend is \"s3\"")
+		}
+		if s.S3Region == "" {
+			return fmt.Errorf("storage.s3_region is required when artifact_backend is \"s3\"")
+		}
+	case "remote":
+		if s.PeerControlPlaneURL == "" {
+			return fmt.Errorf("storage.peer_control_plane_url is required when artifact_backend is \"remote\"")
+		}
+		if s.PeerControlPlaneInternalToken == "" {
+			return fmt.Errorf("storage.peer_control_plane_internal_token is required when artifact_backend is \"remote\" (fail-closed)")
+		}
+		if s.ArtifactPath == "" {
+			return fmt.Errorf("storage.artifact_path is required when artifact_backend is \"remote\" (local cache dir)")
+		}
 	}
 	return nil
 }

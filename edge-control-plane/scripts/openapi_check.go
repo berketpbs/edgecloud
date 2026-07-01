@@ -1,7 +1,8 @@
 //go:build ignore
 
-// openapi_check validates that every route registered in main.go
-// has a corresponding entry in docs/api/openapi.yaml, and vice versa.
+// openapi_check validates that every route registered in main.go and
+// internal/app/app.go has a corresponding entry in docs/api/openapi.yaml,
+// and vice versa.
 // Run with: go run ./scripts/openapi_check.go
 package main
 
@@ -29,8 +30,8 @@ func main() {
 }
 
 func run() error {
-	// Parse routes from main.go
-	routes, err := parseRoutes("cmd/api/main.go")
+	// Parse routes from both main.go and internal/app/app.go
+	routes, err := parseRoutes("cmd/api/main.go", "internal/app/app.go")
 	if err != nil {
 		return fmt.Errorf("parse routes: %w", err)
 	}
@@ -94,15 +95,19 @@ func run() error {
 //   - /openapi.yaml, /docs, /docs/ (spec/doc serving infrastructure)
 //   - /api/... redirect routes (deprecated old paths that redirect to /api/v1/)
 //     These are not part of the OpenAPI contract because they are not real endpoints.
+//   - /api/v1/internal/... routes (service-to-service, not part of the public API)
 func isInfrastructure(route string) bool {
 	if route == "GET /openapi.yaml" || route == "GET /docs" || route == "GET /docs/" {
 		return true
 	}
-	// Anything under /api/ that is NOT /api/v1/ is a deprecated redirect.
 	// Extract the path portion (after "METHOD ").
 	methodAndPath := route
 	if idx := strings.Index(route, " "); idx != -1 {
 		methodAndPath = route[idx+1:]
+	}
+	// Internal service-to-service routes are not part of the public API contract.
+	if strings.HasPrefix(methodAndPath, "/api/v1/internal/") {
+		return true
 	}
 	// Redirect routes: /api/... but not /api/v1/...
 	hasPrefix := strings.HasPrefix(methodAndPath, "/api/")
@@ -110,33 +115,29 @@ func isInfrastructure(route string) bool {
 	return hasPrefix && notVersioned
 }
 
-// parseRoutes extracts all mux.HandleFunc("METHOD /path", ...) from main.go.
-func parseRoutes(filename string) ([]route, error) {
-	// Read the file
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		return nil, err
-	}
-
-	// Match patterns like:
-	// mux.HandleFunc("POST /api/v1/deploy/{appName}", ...)
-	// api.HandleFunc("GET /api/v1/apps", ...)
-	// admin.HandleFunc("DELETE /api/v1/admin/tenants/{tenantID}", ...)
-	// internalMux.HandleFunc("GET /api/v1/internal/download/{deploymentID}", ...)
-	pattern := regexp.MustCompile(`\.HandleFunc\s*\(\s*"([A-Z]+)\s+([^"]+)"`)
-	matches := pattern.FindAllSubmatch(data, -1)
+// parseRoutes extracts all mux.HandleFunc("METHOD /path", ...) and
+// mux.Handle("METHOD /path", ...) calls from the given files.
+func parseRoutes(filenames ...string) ([]route, error) {
+	pattern := regexp.MustCompile(`\.Handle(?:Func)?\s*\(\s*"([A-Z]+)\s+([^"]+)"`)
 
 	var routes []route
 	seen := make(map[string]bool)
-	for _, m := range matches {
-		method := string(m[1])
-		path := string(m[2])
-		// Normalize: strip the version prefix for comparison
-		// Both spec and mux use /api/v1/... so we compare as-is
-		key := method + " " + path
-		if !seen[key] {
-			seen[key] = true
-			routes = append(routes, route{method: method, path: path})
+
+	for _, filename := range filenames {
+		data, err := os.ReadFile(filename)
+		if err != nil {
+			return nil, err
+		}
+
+		matches := pattern.FindAllSubmatch(data, -1)
+		for _, m := range matches {
+			method := string(m[1])
+			path := string(m[2])
+			key := method + " " + path
+			if !seen[key] {
+				seen[key] = true
+				routes = append(routes, route{method: method, path: path})
+			}
 		}
 	}
 

@@ -23,6 +23,11 @@ type appRepoInterface interface {
 	CountByTenant(ctx context.Context, tenantID string) (int, error)
 	AtomicDelete(ctx context.Context, tenantID, appName string) (bool, error)
 	InsertIfNotExists(ctx context.Context, app *domain.App) (bool, error)
+	// GetForUpdate locks the (tenant, app) row with `SELECT … FOR UPDATE`.
+	// Added for the v2 quota-race fix in AddDomain (issue #83 second-pass
+	// review); the lock is held for the caller's tx lifetime.
+	GetForUpdate(ctx context.Context, tenantID, appName string) (*domain.App, error)
+	DeleteIfNoDeployments(ctx context.Context, tenantID, appName string) (bool, error)
 }
 
 // AppService handles app business logic.
@@ -32,7 +37,7 @@ type AppService struct {
 	appEnvRepo    *repository.AppEnvRepository
 	activeRepo    *repository.ActiveDeploymentRepository
 	deployRepo    *repository.DeploymentRepository
-	artifactStore *storage.ArtifactStore
+	artifactStore storage.ArtifactStore
 	quotaRepo     quotaRepoInterface
 }
 
@@ -42,7 +47,7 @@ func NewAppService(
 	deploymentRepo *repository.DeploymentRepository,
 	activeRepo *repository.ActiveDeploymentRepository,
 	appEnvRepo *repository.AppEnvRepository,
-	artifactStore *storage.ArtifactStore,
+	artifactStore storage.ArtifactStore,
 	quotaRepo *repository.QuotaRepository,
 ) *AppService {
 	return &AppService{
@@ -75,7 +80,11 @@ func (s *AppService) Create(ctx context.Context, tenantID, appName string, req *
 		if err != nil {
 			return nil, fmt.Errorf("beginning transaction: %w", err)
 		}
-		defer tx.Rollback()
+		defer func() {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+				log.Printf("app service: failed to rollback transaction: %v", rollbackErr)
+			}
+		}()
 
 		// Lock the tenant row for the duration of this transaction.
 		// Acquire a row lock on the tenant row. The boolean result is unused;
@@ -148,6 +157,17 @@ func (s *AppService) Get(ctx context.Context, tenantID, appName string) (*domain
 	return s.appRepo.Get(ctx, tenantID, appName)
 }
 
+// GetForUpdate locks the (tenant, app) row with `SELECT … FOR UPDATE`
+// for the lifetime of the surrounding tx and returns it. Used by
+// `DomainService.AddDomain` to serialize concurrent domain inserts
+// against the same parent app so the per-app quota
+// (MaxDomainsPerApp) cannot be overshot. Pass-through to
+// `AppRepository.GetForUpdate` — the lock is held until the caller's
+// tx commits or rolls back. Returns (nil, nil) when no app exists.
+func (s *AppService) GetForUpdate(ctx context.Context, tenantID, appName string) (*domain.App, error) {
+	return s.appRepo.GetForUpdate(ctx, tenantID, appName)
+}
+
 // List returns apps for a tenant with pagination.
 func (s *AppService) List(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error) {
 	return s.appRepo.List(ctx, tenantID, limit, offset)
@@ -175,7 +195,7 @@ func (s *AppService) Delete(ctx context.Context, tenantID, appName string) error
 			log.Printf("warning: failed to list deployments for artifact cleanup: %v", err)
 		} else {
 			for _, d := range deployments {
-				if err := s.artifactStore.Delete(tenantID, appName, d.ID); err != nil {
+				if err := s.artifactStore.Delete(ctx, tenantID, appName, d.ID); err != nil {
 					delErr = fmt.Errorf("artifact cleanup failed for %s: %w", d.ID, err)
 				}
 			}
@@ -229,7 +249,11 @@ func (s *AppService) CreateIfNotExists(ctx context.Context, tenantID, appName st
 		if err != nil {
 			return fmt.Errorf("beginning transaction: %w", err)
 		}
-		defer tx.Rollback()
+		defer func() {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+				log.Printf("app service: failed to rollback transaction: %v", rollbackErr)
+			}
+		}()
 
 		// Acquire a row lock on the tenant row. The boolean result is unused;
 		// only the lock (held until tx.Commit) matters for serializing concurrent creates.
@@ -285,4 +309,19 @@ func (s *AppService) CreateIfNotExists(ctx context.Context, tenantID, appName st
 		return fmt.Errorf("creating app: %w", err)
 	}
 	return nil
+}
+
+// DeleteIfNoDeployments removes the apps row for (tenantID, appName)
+// only when zero deployments exist for that app. Used by
+// DeploymentService.Deploy as a compensating write when the first
+// deploy of an app fails at the artifact save step — CreateIfNotExists
+// has already inserted the apps row, and we don't want to leave it
+// orphaned with zero deployments.
+//
+// The conditional DELETE is safe to call concurrently with other
+// deploys: if any deployment exists (succeeded, failed, or in
+// flight), the call is a no-op. Best-effort — callers should log
+// the error and proceed, not fail the request.
+func (s *AppService) DeleteIfNoDeployments(ctx context.Context, tenantID, appName string) (bool, error) {
+	return s.appRepo.DeleteIfNoDeployments(ctx, tenantID, appName)
 }

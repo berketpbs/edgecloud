@@ -3,6 +3,7 @@ name = "edge-config"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
+publish = false
 description = "Shared edgeCloud user-config helpers (config file path, API key + URL loaders)"
 
 [dependencies]
@@ -10,3 +11,6 @@ anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 dirs = "5.0"
+
+[dev-dependencies]
+tempfile = "3"

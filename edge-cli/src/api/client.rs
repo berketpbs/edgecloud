@@ -4,6 +4,7 @@ use anyhow::Result;
 use reqwest::blocking::{Client, Response};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 
 use crate::config::ApiKey;
 
@@ -60,12 +61,36 @@ impl From<serde_json::Error> for ApiError {
 /// Inspect a response and split 2xx (return `Ok`) from 4xx (`Rejected`)
 /// and the rest (`Transient`, after reading whatever body is
 /// available). The body is read once on the non-2xx path.
-fn check_response(resp: Response) -> Result<Response, ApiError> {
+///
+/// `pub(crate)` so sibling accessor structs (`DomainClient`,
+/// `Tenants`, `Keys`, etc.) can reuse the same 2xx/4xx/5xx split
+/// instead of hand-rolling `if !status.is_success()` per method.
+///
+/// The error body is read with a [`std::io::Read::take`] cap at
+/// [`MAX_ERR_BODY`] bytes — the underlying HTTP body itself is
+/// bounded, not just the post-allocation string — so a misbehaving
+/// control plane returning a multi-GB 4xx/5xx body can't OOM the
+/// CLI. The accumulated bytes then flow through [`truncate_body`]
+/// for the UTF-8 char-boundary walk before being plumbed into
+/// either the `Rejected` arm or the `Transient` anyhow! arm.
+/// Issue #109 F9 + follow-up.
+pub(crate) fn check_response(resp: Response) -> Result<Response, ApiError> {
     let status = resp.status();
     if status.is_success() {
         return Ok(resp);
     }
-    let body = resp.text().unwrap_or_default();
+    // Read at most MAX_ERR_BODY + 1 bytes from the response stream
+    // — one more than the cap so `truncate_body` can tell "body fit"
+    // (buf.len() <= MAX_ERR_BODY) apart from "we hit the cap"
+    // (buf.len() == MAX_ERR_BODY + 1). `Take::read_to_end` is a hard
+    // cap: a multi-GB body is discarded by reqwest after the first
+    // MAX_ERR_BODY + 1 bytes. Discarded Result matches the prior
+    // `unwrap_or_default()` semantics for a severed connection
+    // mid-read.
+    use std::io::Read;
+    let mut buf: Vec<u8> = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut resp.take((MAX_ERR_BODY + 1) as u64), &mut buf);
+    let body = truncate_body(&String::from_utf8_lossy(&buf));
     if status.is_client_error() {
         Err(ApiError::Rejected { status, body })
     } else {
@@ -73,6 +98,53 @@ fn check_response(resp: Response) -> Result<Response, ApiError> {
             source: anyhow::anyhow!("server returned {status}: {body}"),
         })
     }
+}
+
+/// Maximum number of bytes of a server response body that the CLI
+/// will buffer into memory before truncating. Caps the worst-case
+/// memory footprint at `MAX_ERR_BODY` per response for a CLI that
+/// serializes requests on a single client. Sized for real error
+/// bodies (typically <1 KiB) with headroom for stack traces on 5xx.
+/// Issue #109 F9. Kept in sync with the same constant in
+/// `edge-migrate/edge-migrate-bin/src/main.rs`.
+const MAX_ERR_BODY: usize = 4 * 1024;
+
+/// Maximum bytes of a SUCCESS response body the CLI will buffer
+/// into memory before failing the parse. Distinct from
+/// [`MAX_ERR_BODY`] because success bodies are bulk endpoints —
+/// `Logs::list` returns up to 1000 records (`logs::list` doc)
+/// where each `LogEntry` averages ~300 bytes and can be multi-KiB
+/// with verbose messages. 4 KiB is correct for diagnostics but
+/// wrong for data: 1000 × 5 KiB ≈ 5 MiB is a realistic worst
+/// case. 8 MiB gives ~50% headroom while bounding the process at
+/// 8 MiB per request (the CLI is single-threaded, so the bound
+/// is global).
+///
+/// Allocated up-front as a `Vec<u8>` capacity hint on every
+/// success-path call. Fine for a one-request-at-a-time CLI; a
+/// future concurrent refactor should revisit. Issue #109 follow-up.
+const MAX_SUCCESS_BODY: u64 = 8 * 1024 * 1024;
+
+/// Cap a server response body at [`MAX_ERR_BODY`] bytes. Real
+/// server error JSON is 100-500 bytes; RFC 7807 problem-detail
+/// payloads are typically <1 KiB. A misbehaving control plane
+/// returning a multi-GB 4xx/5xx body would otherwise OOM the CLI
+/// before the body is printed. Walks down to a UTF-8 char boundary
+/// because `String::truncate` panics on a mid-multibyte-char
+/// index, and a panic in this path would kill a TTY mid-`edge
+/// deploy`. Issue #109 F9.
+fn truncate_body(s: &str) -> String {
+    if s.len() <= MAX_ERR_BODY {
+        return s.to_string();
+    }
+    let mut end = MAX_ERR_BODY;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(end + 16);
+    out.push_str(&s[..end]);
+    out.push_str("... [truncated]");
+    out
 }
 
 /// HTTP client for all control plane API calls.
@@ -135,6 +207,18 @@ pub struct CreateAPIKeyResponse {
     pub token: String,
 }
 
+/// One API key as returned by `GET /api/v1/keys`. Mirrors the Go
+/// `domain.APIKey` field-for-field, minus `last_used` which the
+/// server deliberately omits from the response even though it is
+/// stored in the DB (see issue #106 design notes).
+#[derive(Debug, Deserialize, Serialize)]
+pub struct APIKeySummary {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct WhoamiResponse {
     pub tenant_id: String,
@@ -152,6 +236,75 @@ pub struct WhoamiResponse {
 #[derive(Debug, Deserialize)]
 pub struct RollbackResponse {
     pub deployment_id: String,
+}
+
+/// One tenant log record as returned by GET
+/// `/api/v1/apps/{appName}/logs` (issue #77). Mirrors the Go
+/// `domain.LogEntry` field-for-field; the only divergence is
+/// `labels`, which the CLI decodes into a `serde_json::Value` so
+/// `edge logs` can pretty-print arbitrary label shapes without
+/// needing a typed schema per record.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LogEntry {
+    #[serde(default)]
+    pub id: i64,
+    pub tenant_id: String,
+    pub deployment_id: String,
+    pub app_name: String,
+    pub worker_id: String,
+    pub region: String,
+    pub level: String,
+    pub message: String,
+    /// `serde_json::Value` with `#[serde(default)]` so an empty
+    /// JSON object on the wire deserializes to `Value::Null`
+    /// rather than failing. The CLI uses this in JSON-pipe mode
+    /// (`edge logs myapp | jq`) where shape preservation matters
+    /// more than typed access.
+    #[serde(default)]
+    pub labels: serde_json::Value,
+    pub ts: String,
+}
+
+/// Envelope returned by `GET /api/v1/apps/{appName}/logs`. The
+/// `since` field carries the RFC3339 cutoff the server actually
+/// applied; the CLI's `--follow` mode reads it once at startup to
+/// prime the loop and then advances the cutoff from the newest
+/// returned entry's `ts` (with client-side dedup by id to hide the
+/// boundary row the server returns on every poll).
+#[derive(Debug, Deserialize)]
+pub struct LogListResponse {
+    pub items: Vec<LogEntry>,
+    pub limit: u32,
+    #[serde(default)]
+    pub since: String,
+}
+
+/// Worker-reported status of one app, returned by
+/// `GET /api/v1/apps/{appName}/status`. Mirrors the Go
+/// `domain.AppWorkerStatus` field-for-field.
+///
+/// `status` is the same string the worker publishes in NATS
+/// heartbeats (`running` | `starting` | `stopping` | `crashed` |
+/// `hung` | `unknown`). The CLI's `edge logs` uses
+/// `status == "crashed"` to decide whether to print the
+/// `edge rollback` hint (issue #77 §5).
+///
+/// `last_heartbeat` is `None` when no worker has reported on the
+/// app. The CLI treats a heartbeat older than 5 minutes as stale
+/// (the worker default is 30s) and suppresses the hint, because a
+/// stale `crashed` is more likely a dead worker than an actually
+/// crashed app.
+#[derive(Debug, Deserialize)]
+pub struct AppWorkerStatus {
+    pub app_name: String,
+    pub status: String,
+    /// RFC3339 timestamp; `None` when no worker has reported.
+    pub last_heartbeat: Option<String>,
+    pub region: String,
+    pub worker_id: String,
+    /// Process exit code from the worker's last observation.
+    /// `None` when not provided (e.g. running, hung, or unknown).
+    pub exit_code: Option<i32>,
 }
 
 impl ApiClient {
@@ -190,14 +343,72 @@ impl ApiClient {
         })
     }
 
-    fn auth_header(&self) -> String {
+    pub(crate) fn auth_header(&self) -> String {
         format!("Bearer {}", self.api_key.0)
+    }
+
+    /// The raw bearer token this client authenticates with. Exposed
+    /// for CLI-side UX checks (e.g. `keys revoke`'s post-revoke
+    /// warning) that need to compare against a candidate key id
+    /// without going through a network round-trip. The value is
+    /// the same string the server echoes back as `api_key_id` in
+    /// `whoami`, so this accessor is the local equivalent of
+    /// `client.auth().whoami().api_key_id`.
+    pub(crate) fn bearer(&self) -> &str {
+        &self.api_key.0
     }
 
     /// Returns the base URL this client targets. Useful for surfacing
     /// in error messages.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// GET helper: build a URL, send an authenticated GET, check the
+    /// response, decode JSON. Used by every endpoint that just reads a
+    /// JSON resource (`status`, `list_env`, `list_deployments`,
+    /// `whoami`, `logs::list`).
+    ///
+    /// `format_url` is a closure that takes the base URL and returns the
+    /// full path (with query params when relevant). Extracting this lets
+    /// callers that need query params (`logs::list`) keep that logic
+    /// local while still hitting the auth + check + decode pipeline.
+    ///
+    /// Returns `Result<T, ApiError>` so callers that care about the
+    /// distinction (e.g. `edge auth login`) can branch on Rejected vs
+    /// Transient. Callers that don't can use [`get_json_anyhow`] for a
+    /// flat `Result<T>`.
+    fn get_json<T, F>(&self, format_url: F) -> Result<T, ApiError>
+    where
+        T: serde::de::DeserializeOwned,
+        F: FnOnce(&str) -> String,
+    {
+        let url = format_url(&self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .header("Authorization", self.auth_header())
+            .send()?;
+        let resp = check_response(resp)?;
+        serde_json::from_reader(resp.take(MAX_SUCCESS_BODY)).map_err(ApiError::from)
+    }
+
+    /// Helper for the GET endpoints that surface as `anyhow::Error`
+    /// instead of `ApiError`. Flattens `Rejected` into
+    /// `anyhow!("{op} failed: {status} {body}")` and `Transient` into
+    /// its source. Lets every existing call site keep returning
+    /// `Result<T>` without each one re-writing the same match.
+    fn get_json_anyhow<T, F>(&self, op: &str, format_url: F) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+        F: FnOnce(&str) -> String,
+    {
+        self.get_json(format_url).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("{op} failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })
     }
 
     /// Group accessor for tenant-management endpoints (e.g. signup).
@@ -214,6 +425,46 @@ impl ApiClient {
     /// Group accessor for auth-related endpoints (e.g. whoami).
     pub fn auth(&self) -> Auth<'_> {
         Auth { client: self }
+    }
+
+    /// Group accessor for the logs read endpoint (issue #77).
+    /// Returns [`Logs`], which owns the `list` method that calls
+    /// `GET /api/v1/apps/{appName}/logs`.
+    pub fn logs(&self) -> Logs<'_> {
+        Logs { client: self }
+    }
+
+    /// GET `/api/v1/apps/{appName}/status` — the worker's last reported
+    /// status for an app. Powers the `edge logs` crashed-hint (issue
+    /// #77 §5) and is a useful debugging primitive on its own.
+    ///
+    /// Returns `Result<AppWorkerStatus, ApiError>` so callers (e.g.
+    /// `edge logs`) can choose whether to fail loudly or silently
+    /// skip on a 4xx/5xx. The hint path uses the second form: a
+    /// failed status fetch must NOT prevent the log fetch from
+    /// proceeding, because logs are the user's actual goal.
+    pub fn get_app_status(&self, app_name: &str) -> Result<AppWorkerStatus, ApiError> {
+        self.get_json(|base| format!("{base}/api/v1/apps/{app_name}/status"))
+    }
+
+    /// GET `/api/v1/apps/{appName}/status` with anyhow-typed errors.
+    /// The same endpoint as [`Self::get_app_status`], but routes through
+    /// `get_json_anyhow` so 4xx/5xx surfaces as `runtime status failed:
+    /// {status} {body}` — HTTP status and body in the top frame, not
+    /// buried in a `Caused by:` chain.
+    ///
+    /// Used by `edge status runtime` where the user explicitly asked
+    /// for the data and a 404/401/500 should be diagnostically useful.
+    /// `edge logs` continues to use `get_app_status` because its hint
+    /// path silently swallows failures (logs are the primary goal).
+    pub fn app_status(&self, app_name: &str) -> Result<AppWorkerStatus> {
+        self.get_json_anyhow("runtime status", |base| {
+            format!("{base}/api/v1/apps/{app_name}/status")
+        })
+    }
+
+    pub(crate) fn http(&self) -> &Client {
+        &self.http
     }
 
     /// Upload a deployment artifact.
@@ -281,46 +532,22 @@ impl ApiClient {
             ApiError::Transient { source } => source,
         })?;
 
-        let body: DeployResponse = serde_json::from_str(&resp.text()?)?;
+        let body: DeployResponse = serde_json::from_reader(resp.take(MAX_SUCCESS_BODY))?;
         Ok(body)
     }
 
     /// Get deployment status.
     pub fn status(&self, deployment_id: &str) -> Result<StatusResponse> {
-        let url = format!("{}/api/v1/status/{}", self.base_url, deployment_id);
-        let resp = self
-            .http
-            .get(&url)
-            .header("Authorization", self.auth_header())
-            .send()?;
-
-        let resp = check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("status failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })?;
-
-        serde_json::from_str(&resp.text()?).map_err(Into::into)
+        self.get_json_anyhow("status", |base| {
+            format!("{base}/api/v1/status/{deployment_id}")
+        })
     }
 
     /// List environment variables for an app.
     pub fn list_env(&self, app_name: &str) -> Result<Vec<EnvVar>> {
-        let url = format!("{}/api/v1/apps/{}/env", self.base_url, app_name);
-        let resp = self
-            .http
-            .get(&url)
-            .header("Authorization", self.auth_header())
-            .send()?;
-
-        let resp = check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("list env failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })?;
-
-        serde_json::from_str(&resp.text()?).map_err(Into::into)
+        self.get_json_anyhow("list env", |base| {
+            format!("{base}/api/v1/apps/{app_name}/env")
+        })
     }
 
     /// Set an environment variable.
@@ -348,12 +575,19 @@ impl ApiClient {
         Ok(())
     }
 
-    /// Activate a deployment.
-    pub fn activate(&self, app_name: &str, deployment_id: &str) -> Result<()> {
-        let url = format!(
-            "{}/api/v1/apps/{}/activate/{}",
-            self.base_url, app_name, deployment_id
-        );
+    /// Activate a deployment. If `weight` is Some(N), sends ?weight=N for canary.
+    pub fn activate(&self, app_name: &str, deployment_id: &str, weight: Option<u8>) -> Result<()> {
+        let url = if let Some(w) = weight {
+            format!(
+                "{}/api/v1/apps/{}/activate/{}?weight={}",
+                self.base_url, app_name, deployment_id, w
+            )
+        } else {
+            format!(
+                "{}/api/v1/apps/{}/activate/{}",
+                self.base_url, app_name, deployment_id
+            )
+        };
         let resp = self
             .http
             .post(&url)
@@ -367,6 +601,76 @@ impl ApiClient {
             ApiError::Transient { source } => source,
         })?;
         Ok(())
+    }
+
+    /// Set traffic splits for an app.
+    /// `splits` is a slice of (deployment_id, weight) pairs; weights must sum to 100.
+    pub fn set_traffic(&self, app_name: &str, splits: &[(String, u8)]) -> Result<()> {
+        #[derive(Serialize)]
+        struct SplitEntry {
+            deployment_id: String,
+            weight: u8,
+        }
+        #[derive(Serialize)]
+        struct TrafficRequest<'a> {
+            splits: &'a [SplitEntry],
+        }
+        let url = format!("{}/api/v1/apps/{}/traffic", self.base_url, app_name);
+        let body = serde_json::to_string(&TrafficRequest {
+            splits: &splits
+                .iter()
+                .map(|(id, w)| SplitEntry {
+                    deployment_id: id.clone(),
+                    weight: *w,
+                })
+                .collect::<Vec<_>>(),
+        })?;
+        let resp = self
+            .http
+            .put(&url)
+            .header("Authorization", self.auth_header())
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()?;
+
+        check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("set_traffic failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
+        Ok(())
+    }
+
+    /// Get current traffic splits for an app.
+    pub fn get_traffic(&self, app_name: &str) -> Result<Vec<(String, u8)>> {
+        #[derive(Deserialize)]
+        struct SplitEntry {
+            deployment_id: String,
+            weight: u8,
+        }
+        #[derive(Deserialize)]
+        struct TrafficResponse {
+            splits: Vec<SplitEntry>,
+        }
+        let url = format!("{}/api/v1/apps/{}/traffic", self.base_url, app_name);
+        let resp = self
+            .http
+            .get(&url)
+            .header("Authorization", self.auth_header())
+            .send()?;
+
+        let resp = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("get_traffic failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
+        let v: TrafficResponse = serde_json::from_reader(resp.take(MAX_SUCCESS_BODY))?;
+        Ok(v.splits
+            .into_iter()
+            .map(|s| (s.deployment_id, s.weight))
+            .collect())
     }
 
     /// Rollback the active deployment of `app_name` to the stored
@@ -389,26 +693,24 @@ impl ApiClient {
             ApiError::Transient { source } => source,
         })?;
 
-        serde_json::from_str(&resp.text()?).map_err(Into::into)
+        serde_json::from_reader(resp.take(MAX_SUCCESS_BODY)).map_err(Into::into)
     }
 
     /// List all deployments for an app.
     pub fn list_deployments(&self, app_name: &str) -> Result<Vec<DeploymentSummary>> {
-        let url = format!("{}/api/v1/list/{}", self.base_url, app_name);
-        let resp = self
-            .http
-            .get(&url)
-            .header("Authorization", self.auth_header())
-            .send()?;
+        self.get_json_anyhow("list deployments", |base| {
+            format!("{base}/api/v1/list/{app_name}")
+        })
+    }
 
-        let resp = check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("list deployments failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })?;
+    // ---- Custom-domain (issue #83) ----
 
-        serde_json::from_str(&resp.text()?).map_err(Into::into)
+    /// Accessor for the `domains` namespace. The returned `DomainClient`
+    /// borrows this `ApiClient` so the API-key + base_url are shared
+    /// across all subcommands without cloning the underlying HTTP
+    /// client (which is already internally `Arc`-shared by reqwest).
+    pub fn domains(&self) -> crate::api::domains::DomainClient<'_> {
+        crate::api::domains::DomainClient { client: self }
     }
 }
 
@@ -446,7 +748,7 @@ impl<'a> Tenants<'a> {
             }
             ApiError::Transient { source } => source,
         })?;
-        serde_json::from_str(&resp.text()?).map_err(Into::into)
+        serde_json::from_reader(resp.take(MAX_SUCCESS_BODY)).map_err(Into::into)
     }
 }
 
@@ -484,7 +786,43 @@ impl<'a> Keys<'a> {
             }
             ApiError::Transient { source } => source,
         })?;
-        serde_json::from_str(&resp.text()?).map_err(Into::into)
+        serde_json::from_reader(resp.take(MAX_SUCCESS_BODY)).map_err(Into::into)
+    }
+
+    /// GET `/api/v1/keys` — list all API keys for the caller's tenant.
+    /// Returns an inline array (no envelope); used by `edge auth keys list`.
+    pub fn list(&self) -> Result<Vec<APIKeySummary>> {
+        let url = format!("{}/api/v1/keys", self.client.base_url);
+        let resp = self
+            .client
+            .http
+            .get(&url)
+            .header("Authorization", self.client.auth_header())
+            .send()?;
+
+        let resp = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("keys list failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
+        serde_json::from_reader(resp.take(MAX_SUCCESS_BODY)).map_err(Into::into)
+    }
+
+    /// DELETE `/api/v1/keys/{id}` — hard-delete the key with the given
+    /// id. Returns `Ok(())` on 204 No Content, `Err(ApiError::Rejected)`
+    /// on 4xx (caller can pattern-match for clean user-facing errors),
+    /// and `Err(ApiError::Transient)` on 5xx or network failure.
+    pub fn revoke(&self, id: &str) -> Result<(), ApiError> {
+        let url = format!("{}/api/v1/keys/{}", self.client.base_url, id);
+        let resp = self
+            .client
+            .http
+            .delete(&url)
+            .header("Authorization", self.client.auth_header())
+            .send()?;
+        let _ = check_response(resp)?;
+        Ok(())
     }
 }
 
@@ -502,16 +840,8 @@ impl<'a> Auth<'a> {
     /// react accordingly. Use `whoami_anyhow` for the simple
     /// `Result<WhoamiResponse>` shape.
     pub fn whoami(&self) -> Result<WhoamiResponse, ApiError> {
-        let url = format!("{}/api/v1/auth/whoami", self.client.base_url);
-        let resp = self
-            .client
-            .http
-            .get(&url)
-            .header("Authorization", self.client.auth_header())
-            .send()?;
-
-        let resp = check_response(resp)?;
-        serde_json::from_str(&resp.text()?).map_err(ApiError::from)
+        self.client
+            .get_json(|base| format!("{base}/api/v1/auth/whoami"))
     }
 
     /// Convenience wrapper around [`whoami`] that flattens the
@@ -525,6 +855,69 @@ impl<'a> Auth<'a> {
             }
             ApiError::Transient { source } => source,
         })
+    }
+}
+
+/// Log read endpoints (issue #77). Borrows the parent [`ApiClient`].
+pub struct Logs<'a> {
+    client: &'a ApiClient,
+}
+
+impl<'a> Logs<'a> {
+    /// GET `/api/v1/apps/{appName}/logs` — list the most recent
+    /// log entries for the app, newest first.
+    ///
+    /// All query parameters are optional. `since_rfc3339` is an
+    /// absolute RFC3339 cutoff (the caller converts a relative
+    /// `--since 5m` into an absolute timestamp before calling).
+    /// The server defaults to the last 5 minutes when omitted.
+    /// `level` is the minimum severity (`trace|debug|info|warn|error`).
+    /// `limit` is clamped to [1, 1000] server-side; the CLI sends
+    /// the user-supplied value through unmodified.
+    ///
+    /// Errors: any non-2xx becomes a flat `anyhow::Error` carrying
+    /// the status and body. 4xx rejections (e.g. invalid level)
+    /// surface as the message so `edge logs` can show the
+    /// server-typed reason to the user.
+    pub fn list(
+        &self,
+        app_name: &str,
+        since_rfc3339: Option<&str>,
+        level: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<LogListResponse> {
+        // Build the URL with optional query params locally, then
+        // hand the formatted string to `get_json_anyhow` for the
+        // auth + check + decode pipeline. The URL build is the only
+        // call-site-specific piece; the rest is generic.
+        let mut parsed = reqwest::Url::parse(&format!(
+            "{}/api/v1/apps/{}/logs",
+            self.client.base_url, app_name
+        ))
+        .map_err(|e| anyhow::anyhow!("invalid base url: {e}"))?;
+        if let Some(since) = since_rfc3339 {
+            if !since.is_empty() {
+                parsed.query_pairs_mut().append_pair("since", since);
+            }
+        }
+        if let Some(lvl) = level {
+            if !lvl.is_empty() {
+                parsed.query_pairs_mut().append_pair("level", lvl);
+            }
+        }
+        if let Some(n) = limit {
+            // `0` is the CLI's "use server default" signal (the
+            // handler treats it the same as omitted). We only emit
+            // the param when > 0 so the URL is clean.
+            if n > 0 {
+                parsed
+                    .query_pairs_mut()
+                    .append_pair("limit", &n.to_string());
+            }
+        }
+        let url = parsed.to_string();
+
+        self.client.get_json_anyhow("logs", |_| url.clone())
     }
 }
 
@@ -559,5 +952,59 @@ mod tests {
         let err: serde_json::Error = serde_json::from_str::<i32>("not int").unwrap_err();
         let e: ApiError = err.into();
         assert!(matches!(e, ApiError::Transient { .. }));
+    }
+
+    // F9: `truncate_body` must (a) leave short bodies unchanged,
+    // (b) cap at MAX_ERR_BODY + marker for long bodies, and
+    // (c) walk down to a UTF-8 char boundary instead of
+    // panicking mid-multibyte-char. The marker is ASCII so it's
+    // safe to write into any log pipeline.
+
+    #[test]
+    fn truncate_body_short_input_returned_unchanged() {
+        let s = "invalid key".to_string();
+        assert_eq!(truncate_body(&s), s);
+    }
+
+    #[test]
+    fn truncate_body_exact_cap_returned_unchanged() {
+        let s = "a".repeat(MAX_ERR_BODY);
+        // Equal to cap → no truncation, no marker. Marker is only
+        // added when the input exceeds the cap.
+        assert_eq!(truncate_body(&s), s);
+        assert!(!truncate_body(&s).contains("[truncated]"));
+    }
+
+    #[test]
+    fn truncate_body_over_cap_gets_marker_and_larger_bytes_pre_counted() {
+        // 8 KiB of 'A'. The output must (a) be at most MAX_ERR_BODY
+        // bytes of prefix + a short marker, and (b) contain the
+        // marker; (c) NOT contain the full 8 KiB verbatim.
+        let s = "A".repeat(8 * 1024);
+        let out = truncate_body(&s);
+        assert!(out.starts_with(&"A".repeat(MAX_ERR_BODY)));
+        assert!(out.ends_with("... [truncated]"));
+        assert!(out.len() <= MAX_ERR_BODY + "... [truncated]".len());
+        // The original 8 KiB body must not survive verbatim.
+        assert!(!out.starts_with(&"A".repeat(MAX_ERR_BODY + 1)));
+    }
+
+    #[test]
+    fn truncate_body_walks_down_to_utf8_char_boundary() {
+        // Construct a string of length MAX_ERR_BODY + 1 whose byte
+        // at index MAX_ERR_BODY is the start of a 3-byte UTF-8
+        // sequence (e.g. U+3000 ideographic space = E3 80 80). The
+        // function must not panic and must end on a valid char
+        // boundary.
+        let mut s: String = "a".repeat(MAX_ERR_BODY - 1);
+        s.push('\u{3000}'); // 3 bytes
+                            // Now s.len() == MAX_ERR_BODY - 1 + 3 == MAX_ERR_BODY + 2.
+        assert!(s.len() > MAX_ERR_BODY);
+        let out = truncate_body(&s);
+        assert!(out.is_char_boundary(out.find("... [truncated]").unwrap()));
+        assert!(!out.is_empty());
+        // The marker must be present and the function must have
+        // returned without panicking.
+        assert!(out.ends_with("... [truncated]"));
     }
 }

@@ -20,6 +20,23 @@ where
 }
 
 /// TaskMessage: received via NATS on `edgecloud.tasks.<region>`.
+///
+/// Two variants share the same `apps` payload shape but carry different
+/// semantics:
+///
+/// * `task_update` — published when an app set changes (activate / rollback /
+///   env edit). Workers diff against current state.
+/// * `full_sync` — published periodically (every `RECONCILE_INTERVAL`,
+///   default 5 min) and on worker registration, listing the **complete**
+///   active app set for the tenant. Workers treat the message as
+///   authoritative: stop any app not in the set, start any missing, restart
+///   any whose `deployment_id` doesn't match. Closes the gap when a NATS
+///   `task_update` is lost (workqueue `WorkQueuePolicy` has no replay
+///   support — see issue #53).
+///
+/// Both variants use the same handler logic; the only difference is the
+/// observability hook (`reconcile_full_sync_total` counter) so an operator
+/// can distinguish a scheduled sync from an event-driven update in metrics.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum TaskMessage {
@@ -30,6 +47,32 @@ pub enum TaskMessage {
         tenant_id: String,
         apps: HashMap<String, AppSpec>,
     },
+    #[serde(rename = "full_sync")]
+    FullSync {
+        #[allow(dead_code)]
+        timestamp: String,
+        tenant_id: String,
+        apps: HashMap<String, AppSpec>,
+    },
+}
+
+/// DeploymentRoute: a single destination in a weighted traffic split.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeploymentRoute {
+    pub deployment_id: String,
+    /// SHA-256 of this deployment's wasm artifact. Each route carries its
+    /// own hash — the top-level `AppSpec::deployment_hash` only describes
+    /// the primary deployment, so without this field the worker would
+    /// download the primary's binary for every canary route (and verify it
+    /// against the wrong hash, failing for any deployment whose artifact
+    /// differs from the primary's).
+    pub deployment_hash: String,
+    /// Reserved for canary weight propagation; the worker currently uses 100%
+    /// for every route and applies the weight at the ingress layer. Held on the
+    /// struct so the wire format stays in sync with `edge-ingress` and the
+    /// Go control plane, both of which already read it.
+    #[allow(dead_code)]
+    pub weight: u8,
 }
 
 /// AppSpec: specification for a single deployed app.
@@ -37,6 +80,12 @@ pub enum TaskMessage {
 pub struct AppSpec {
     pub deployment_id: String,
     pub deployment_hash: String,
+    /// Optional traffic split. When present, the worker runs ALL deployments
+    /// listed (not just the primary one) concurrently. None = legacy mode
+    /// (single deployment_id only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)]
+    pub routes: Option<Vec<DeploymentRoute>>,
     pub env: HashMap<String, String>,
     /// Per-deployment egress allowlist. `None` means allow-all outbound (field
     /// absent or `[]` on the wire — both safe defaults for pre-enforcement
@@ -87,6 +136,33 @@ pub struct AppStatus {
     /// Port the app's HTTP server is listening on, on the worker host.
     /// Used by the public ingress to dial the upstream.
     pub port: u16,
+    /// Guest-emitted metrics from `edge:observe` (counters, gauges,
+    /// histogram samples) since the last heartbeat. Defaults to empty when
+    /// absent so old control planes that don't parse this field keep
+    /// working — new control planes ingest the samples and serve them via
+    /// the Prometheus endpoints.
+    #[serde(default)]
+    pub observer_metrics: Vec<MetricSample>,
+}
+
+/// Kind of metric emitted via `edge:observe`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricKind {
+    Counter,
+    Gauge,
+    HistogramSample,
+}
+
+/// A single metric sample shipped inside a heartbeat.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricSample {
+    pub name: String,
+    pub kind: MetricKind,
+    /// For counters: the counter value. For gauges: the gauge value.
+    /// For histogram samples: the observed sample value.
+    pub value: f64,
+    pub labels: Vec<(String, String)>,
 }
 
 impl HeartbeatMessage {
@@ -187,6 +263,58 @@ mod tests {
         serde_json::from_str(json).expect("deserialize AppStatus")
     }
 
+    /// Old workers that don't send `observer_metrics` must deserialize to
+    /// an empty Vec, not fail. Old control planes ignore the field.
+    #[test]
+    fn observer_metrics_absent_deserializes_to_empty() {
+        let s = app_status_from_json(
+            r#"{"deployment_id":"d_1","status":"running","exit_code":null,"request_count":5,"tenant_id":"t_1","port":8080}"#,
+        );
+        assert!(s.observer_metrics.is_empty());
+    }
+
+    /// `observer_metrics` round-trips correctly with all three metric kinds.
+    #[test]
+    fn observer_metrics_round_trips() {
+        let s = AppStatus {
+            deployment_id: "d_1".into(),
+            status: "running".into(),
+            exit_code: None,
+            request_count: 1,
+            outbound_bytes: 0,
+            tenant_id: "t_1".into(),
+            port: 8080,
+            observer_metrics: vec![
+                MetricSample {
+                    name: "hits".into(),
+                    kind: MetricKind::Counter,
+                    value: 42.0,
+                    labels: vec![("route".into(), "/api".into())],
+                },
+                MetricSample {
+                    name: "mem".into(),
+                    kind: MetricKind::Gauge,
+                    value: 512.0,
+                    labels: vec![],
+                },
+                MetricSample {
+                    name: "latency_ms".into(),
+                    kind: MetricKind::HistogramSample,
+                    value: 12.5,
+                    labels: vec![],
+                },
+            ],
+        };
+        let json = serde_json::to_string(&s).expect("serialize");
+        let parsed: AppStatus = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.observer_metrics.len(), 3);
+        assert_eq!(parsed.observer_metrics[0].name, "hits");
+        assert_eq!(parsed.observer_metrics[0].kind, MetricKind::Counter);
+        assert_eq!(parsed.observer_metrics[0].value, 42.0);
+        assert_eq!(parsed.observer_metrics[1].kind, MetricKind::Gauge);
+        assert_eq!(parsed.observer_metrics[2].kind, MetricKind::HistogramSample);
+    }
+
     /// Old workers that don't send `outbound_bytes` must deserialize to 0,
     /// not fail. The control plane treats 0 as "no data for this interval".
     #[test]
@@ -218,6 +346,7 @@ mod tests {
             outbound_bytes: 512,
             tenant_id: "t_1".into(),
             port: 8080,
+            observer_metrics: vec![],
         };
         let json = serde_json::to_string(&s).expect("serialize");
         assert!(
@@ -286,5 +415,100 @@ mod tests {
                 "*.sendgrid.net".to_string()
             ])
         );
+    }
+
+    // ── TaskMessage::FullSync wire format (issue #53) ─────────────────────
+
+    /// `task_update` parses into the `TaskUpdate` variant (regression
+    /// guard for the existing path; included here so a future variant
+    /// rename doesn't silently break the old path).
+    #[test]
+    fn task_update_deserializes_to_task_update_variant() {
+        let json = r#"{
+            "type": "task_update",
+            "timestamp": "2026-06-19T00:00:00Z",
+            "tenant_id": "t_1",
+            "apps": {
+                "myapp": {
+                    "deployment_id": "d_1",
+                    "deployment_hash": "abc",
+                    "env": {},
+                    "max_memory_mb": 256
+                }
+            }
+        }"#;
+        let msg: TaskMessage = serde_json::from_str(json).expect("deserialize task_update");
+        match msg {
+            TaskMessage::TaskUpdate {
+                tenant_id, apps, ..
+            } => {
+                assert_eq!(tenant_id, "t_1");
+                assert_eq!(apps.len(), 1);
+                assert!(apps.contains_key("myapp"));
+            }
+            TaskMessage::FullSync { .. } => panic!("task_update parsed as FullSync"),
+        }
+    }
+
+    /// `full_sync` parses into the `FullSync` variant with the same `apps`
+    /// payload shape as `task_update`. Lock the wire so a future spec change
+    /// on either side fails fast here.
+    #[test]
+    fn full_sync_deserializes_to_full_sync_variant() {
+        let json = r#"{
+            "type": "full_sync",
+            "timestamp": "2026-06-19T00:00:00Z",
+            "tenant_id": "t_1",
+            "apps": {
+                "myapp": {
+                    "deployment_id": "d_1",
+                    "deployment_hash": "abc",
+                    "env": {"KEY": "value"},
+                    "max_memory_mb": 256,
+                    "allowlist": ["api.stripe.com"]
+                },
+                "other": {
+                    "deployment_id": "d_2",
+                    "deployment_hash": "def",
+                    "env": {},
+                    "max_memory_mb": 128
+                }
+            }
+        }"#;
+        let msg: TaskMessage = serde_json::from_str(json).expect("deserialize full_sync");
+        let (tenant_id, apps) = match msg {
+            TaskMessage::FullSync {
+                tenant_id, apps, ..
+            } => (tenant_id, apps),
+            TaskMessage::TaskUpdate { .. } => panic!("full_sync parsed as TaskUpdate"),
+        };
+        assert_eq!(tenant_id, "t_1");
+        assert_eq!(apps.len(), 2);
+        assert_eq!(apps["myapp"].deployment_id, "d_1");
+        assert_eq!(
+            apps["myapp"].env.get("KEY").map(String::as_str),
+            Some("value")
+        );
+        assert_eq!(
+            apps["myapp"].allowlist,
+            Some(vec!["api.stripe.com".to_string()])
+        );
+        assert_eq!(apps["other"].deployment_hash, "def");
+        assert_eq!(apps["other"].max_memory_mb, 128);
+    }
+
+    /// Unknown `type` values must fail to deserialize rather than silently
+    /// fall through to a default variant. The CP and worker ship together,
+    /// so this guards against a divergent deployment.
+    #[test]
+    fn unknown_type_field_fails_to_deserialize() {
+        let json = r#"{
+            "type": "bogus",
+            "timestamp": "2026-06-19T00:00:00Z",
+            "tenant_id": "t_1",
+            "apps": {}
+        }"#;
+        let res: Result<TaskMessage, _> = serde_json::from_str(json);
+        assert!(res.is_err(), "unknown type field must fail to parse");
     }
 }

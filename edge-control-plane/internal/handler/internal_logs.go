@@ -10,6 +10,7 @@ import (
 	"net/http"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 )
 
@@ -101,7 +102,11 @@ func (h *InternalHandler) IngestLogs(w http.ResponseWriter, r *http.Request) {
 	// Cap request body before decoding. MaxBytesReader returns a
 	// *http.MaxBytesError when the (N+1)-th read past the cap is attempted.
 	r.Body = http.MaxBytesReader(w, r.Body, MaxLogBatchSize)
-	defer r.Body.Close()
+	defer func() {
+		if err := r.Body.Close(); err != nil {
+			log.Printf("IngestLogs: failed to close request body: %v", err)
+		}
+	}()
 
 	var req IngestLogsRequest
 	// Lenient decode: unknown fields are accepted so a future worker struct
@@ -116,7 +121,7 @@ func (h *InternalHandler) IngestLogs(w http.ResponseWriter, r *http.Request) {
 		var maxErr *http.MaxBytesError
 		switch {
 		case errors.As(err, &maxErr):
-			http.Error(w, `{"error": "batch too large"}`, http.StatusBadRequest)
+			httperror.MaxBodyBytes(w, err, http.StatusBadRequest, "batch too large")
 		case errors.Is(err, io.EOF):
 			http.Error(w, `{"error": "empty body"}`, http.StatusBadRequest)
 		default:
