@@ -66,9 +66,41 @@ jobs:
         run: cargo audit || true
 
   # ============================================================
-  # RUST-TEST — Run cargo nextest and cargo-semver-checks
+  # RUST-TEST — Run cargo nextest
   # ============================================================
   rust-test:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "1"
+      RUSTFLAGS: "-C opt-level=0 -C debuginfo=0 -C link-arg=-fuse-ld=mold"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang mold
+
+      - name: Generate Cargo.lock
+        run: cargo generate-lockfile || true
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@cargo-nextest
+
+      - name: Run tests (nextest)
+        run: cargo nextest run --workspace
+
+  # ============================================================
+  # RUST-SEMVER — Run cargo-semver-checks
+  # ============================================================
+  rust-semver:
     runs-on: ubuntu-latest
     env:
       CARGO_INCREMENTAL: "1"
@@ -96,12 +128,6 @@ jobs:
 
       - name: Run cargo-semver-checks
         run: cargo semver-checks check-release --workspace --baseline-rev origin/main
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@cargo-nextest
-
-      - name: Run tests (nextest)
-        run: cargo nextest run --workspace
 
   # ============================================================
   # RUST-NIGHTLY — Run nightly-only analyses (udeps, geiger)
