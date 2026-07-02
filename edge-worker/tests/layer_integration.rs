@@ -645,6 +645,7 @@ async fn l11_guest_calls_process_get_env() {
 /// L12: call time.now() from the guest. Assert the response is a
 /// parseable u64 > 0 (a valid Unix millisecond timestamp).
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "CI port collision in layer_integration — see #212. Re-enable once spawn_handler_with_config uses port-0 (OS-assigned)."]
 async fn l12_guest_calls_time_now() {
     if should_skip_layer_tests() {
         return;
@@ -693,6 +694,7 @@ async fn l12_guest_calls_time_now() {
 /// L13: kv-store round-trip from the guest. Set a key, then get it
 /// back in a second request.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "CI port collision in layer_integration — see #212. Re-enable once spawn_handler_with_config uses port-0 (OS-assigned)."]
 async fn l13_guest_calls_kv_store_round_trip() {
     if should_skip_layer_tests() {
         return;
