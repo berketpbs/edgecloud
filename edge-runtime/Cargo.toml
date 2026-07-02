@@ -104,3 +104,14 @@ struct_missing = "allow"
 struct_pub_field_missing = "allow"
 trait_missing = "allow"
 variant_missing = "allow"
+
+# `cargo-udeps` (run on nightly) flags `metrics`, `clock`, and
+# `tracing-subscriber` as unused because their usage is gated by the
+# `observe` / `time` features, which it does not enable by default.
+# They are used under `--features observe --features time`, which
+# is what the runtime+worker integration tests build with.
+[package.metadata.cargo-udeps.ignore]
+clock = ["feature-gate: time"]
+metrics = ["feature-gate: observe"]
+tracing-subscriber = ["dev-only"]
+wiremock = ["dev-only"]

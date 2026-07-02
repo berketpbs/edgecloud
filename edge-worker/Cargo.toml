@@ -95,3 +95,10 @@ edge-ingress = { path = "../edge-ingress" }
 [package.metadata.cargo-semver-checks.lints]
 constructible_struct_adds_field = "allow"
 enum_variant_added = "allow"
+
+# `cargo-udeps` flags `axum` as unused because the only call site
+# (`l8_long_running_self_host`) is a deferred fixture whose test
+# module is gated off the default `cargo test` build. It IS used
+# in the long-running fixtures, see the PR description.
+[package.metadata.cargo-udeps.ignore]
+axum = ["feature-gate: long-running-fixtures"]
