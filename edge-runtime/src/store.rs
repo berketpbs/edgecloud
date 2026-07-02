@@ -14,7 +14,7 @@ pub fn create_store<T>(engine: &Engine, max_memory_mb: u64, data: T) -> Store<T>
     }
 
     let limits = new_memory_limits(max_memory_mb);
-    let limiter = StaticLimiter::new(limits);
+    let mut limiter = StaticLimiter::new(limits);
     store.limiter(move |_data| limiter.limiter());
 
     store
@@ -34,17 +34,19 @@ impl StaticLimiter {
         }
     }
 
-    fn limiter(&self) -> &'static mut dyn ResourceLimiter {
-        // SAFETY: Box::leak gives us ownership with 'static lifetime.
-        // NonNull is aliasing-free. StoreLimits implements ResourceLimiter.
-        // wasmtime calls this for the lifetime of the store, which is fine
-        // since the leaked box is never freed.
-        unsafe { &mut *self.ptr.as_ptr() }
+    fn limiter(&mut self) -> &'static mut dyn ResourceLimiter {
+        // SAFETY: `ptr` points to a uniquely-owned, never-freed `Box::leak`
+        // allocation. `&mut self` guarantees this method cannot be called
+        // concurrently or re-entrantly, so at most one `&'static mut` reference
+        // to the underlying `StoreLimits` exists at a time — no aliasing.
+        unsafe { self.ptr.as_mut() as &'static mut dyn ResourceLimiter }
     }
 }
 
-// SAFETY: StaticLimiter owns a 'static leaked Box<StoreLimits>. wasmtime calls
-// the limiter from its synchronized internal context, so &self is safe.
+// SAFETY: StaticLimiter is captured by move into an FnMut closure owned by a
+// single wasmtime Store. `Store` is not Send; the limiter is only ever accessed
+// from the thread that drives the store. NonNull<StoreLimits> is not auto-Send/
+// Sync (raw pointer), so we assert it manually.
 unsafe impl Send for StaticLimiter {}
 unsafe impl Sync for StaticLimiter {}
 
