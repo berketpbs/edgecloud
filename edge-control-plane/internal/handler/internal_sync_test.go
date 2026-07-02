@@ -68,12 +68,6 @@ func withSyncJWT(r *http.Request, workerID, tenantID, region string) *http.Reque
 	return r.WithContext(ctx)
 }
 
-// withSyncJWTTenant (kept for callers that only care about the tenant
-// claim — same as withSyncJWT with workerID="" and region="").
-func withSyncJWTTenant(r *http.Request, tenantID string) *http.Request {
-	return withSyncJWT(r, "", tenantID, "")
-}
-
 // --- Sync ---------------------------------------------------------
 
 func TestSync_NilBuilder_Returns501(t *testing.T) {
