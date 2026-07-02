@@ -56,7 +56,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -70,13 +69,27 @@ use reqwest::StatusCode;
 use tokio::sync::broadcast;
 use wasmtime::component::{Component, InstancePre};
 
-/// Shared atomic port counter for integration tests running in parallel.
-/// Starts at 30000 to avoid clashing with ephemeral ports or developer services.
-static NEXT_PORT: AtomicU16 = AtomicU16::new(30000);
-
-/// Allocate a unique port for an integration test dispatch.
-fn alloc_port() -> u16 {
-    NEXT_PORT.fetch_add(1, Ordering::Relaxed)
+/// Open a `127.0.0.1:0` listener and snapshot the kernel-assigned
+/// port, then drop the listener. The brief window between drop and
+/// the dispatch's own bind in `HandlerDispatch::serve` is small
+/// enough that no test in this binary can race for the same port
+/// (each test process binds its own ephemeral port, and the kernel
+/// never re-allocates a port to a process that already holds one).
+///
+/// Replaces the prior static-counter allocator (`NEXT_PORT` started
+/// at 30000 and incremented atomically), which raced across nextest
+/// subprocesses and triggered EADDRINUSE on the v0.2 PR CI lane.
+/// See issue #212 for the broader architectural fix on the
+/// production side (move the bind into `HandlerDispatch::new`).
+///
+/// Returns `Err` on bind failure; bind-success is the only signal
+/// that the kernel had a free ephemeral port, which it essentially
+/// always does on Linux/macOS.
+fn ephemeral_port() -> Option<u16> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?;
+    let port = listener.local_addr().ok()?.port();
+    drop(listener);
+    Some(port)
 }
 
 /// Skip predicate for the layer integration tests. Unlike the supervisor
@@ -147,7 +160,7 @@ impl LayerHarness {
 
         // Port allocation: prefer 8192+ (ephemeral range, less likely
         // to clash with a developer's local services).
-        let port = alloc_port();
+        let port = ephemeral_port().expect("bind ephemeral port");
 
         let config = HandlerConfig {
             tenant_id: "test-tenant".to_string(),
@@ -418,7 +431,7 @@ async fn l7_per_request_timeout_returns_500() {
         .instantiate_pre(&component)
         .expect("linker.instantiate_pre");
 
-    let port = alloc_port();
+    let port = ephemeral_port().expect("bind ephemeral port");
 
     let config = HandlerConfig {
         tenant_id: "test-tenant".to_string(),
@@ -506,7 +519,7 @@ async fn spawn_handler_with_config(config: HandlerConfig) -> (u16, broadcast::Se
         .instantiate_pre(&component)
         .expect("linker.instantiate_pre");
 
-    let port = alloc_port();
+    let port = ephemeral_port().expect("bind ephemeral port");
 
     let dispatch = Arc::new(
         HandlerDispatch::new(instance_pre, port, 5_000, 10, config).expect("HandlerDispatch::new"),
@@ -645,7 +658,6 @@ async fn l11_guest_calls_process_get_env() {
 /// L12: call time.now() from the guest. Assert the response is a
 /// parseable u64 > 0 (a valid Unix millisecond timestamp).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "CI port collision in layer_integration — see #212. Re-enable once spawn_handler_with_config uses port-0 (OS-assigned)."]
 async fn l12_guest_calls_time_now() {
     if should_skip_layer_tests() {
         return;
@@ -694,7 +706,6 @@ async fn l12_guest_calls_time_now() {
 /// L13: kv-store round-trip from the guest. Set a key, then get it
 /// back in a second request.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "CI port collision in layer_integration — see #212. Re-enable once spawn_handler_with_config uses port-0 (OS-assigned)."]
 async fn l13_guest_calls_kv_store_round_trip() {
     if should_skip_layer_tests() {
         return;
