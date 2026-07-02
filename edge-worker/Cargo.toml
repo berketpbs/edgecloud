@@ -101,4 +101,4 @@ enum_variant_added = "allow"
 # module is gated off the default `cargo test` build. It IS used
 # in the long-running fixtures, see the PR description.
 [package.metadata.cargo-udeps.ignore]
-axum = ["feature-gate: long-running-fixtures"]
+normal = ["axum"]

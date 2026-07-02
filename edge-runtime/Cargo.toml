@@ -111,7 +111,5 @@ variant_missing = "allow"
 # They are used under `--features observe --features time`, which
 # is what the runtime+worker integration tests build with.
 [package.metadata.cargo-udeps.ignore]
-clock = ["feature-gate: time"]
-metrics = ["feature-gate: observe"]
-tracing-subscriber = ["dev-only"]
-wiremock = ["dev-only"]
+normal = ["clock", "metrics"]
+development = ["tracing-subscriber", "wiremock"]
