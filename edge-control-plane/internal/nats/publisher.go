@@ -66,6 +66,25 @@ type HeartbeatMessage struct {
 	WorkerID  string                      `json:"worker_id"`
 	Region    string                      `json:"region"`
 	Apps      map[string]domain.AppStatus `json:"apps"`
+	// ClusterHeadroom carries capacity info for the autoscaler (issue #85).
+	// Optional on the wire so pre-#85 workers (no field) still serialize
+	// cleanly through this struct, and a new worker talking to an old
+	// control plane has the field silently dropped by the consumer's
+	// partial unmarshal — both directions safe.
+	//
+	// The autoscaler reads `AppSlots` from this block; CPUPct / MemPct are
+	// observability-only for now (no sysinfo on the worker yet).
+	ClusterHeadroom *ClusterHeadroom `json:"cluster_headroom,omitempty"`
+}
+
+// ClusterHeadroom mirrors the Rust `ClusterHeadroom` struct in
+// edge-worker/src/messages.rs. AppSlots is the only field the autoscaler
+// acts on; the rest are pass-through for future PRs that add
+// system-introspection.
+type ClusterHeadroom struct {
+	CPUPct   *float64 `json:"cpu_pct,omitempty"`
+	MemPct   *float64 `json:"mem_pct,omitempty"`
+	AppSlots uint32   `json:"app_slots"`
 }
 
 // StreamConfig describes a JetStream stream to be created/verified.
@@ -96,6 +115,37 @@ func applyTypeOverride(msg *TaskMessage, typeField string) *TaskMessage {
 		TenantID:  msg.TenantID,
 		Apps:      msg.Apps,
 	}
+}
+
+// BuildAppConfig is the single source of truth for constructing an
+// AppConfig. The previous implementation had this literal duplicated at
+// 7 sites across internal/service/{deployment,reconcile,traffic}.go
+// — exactly how the TaskUpdate / FullSync wire shape drifted apart
+// before PR #166. Use this everywhere; new fields on AppConfig get
+// the default for free.
+//
+// `routes` is variadic for ergonomics: omit it for single-deployment
+// publishes; pass a non-empty slice to activate canary splits. The
+// `omitempty` JSON tag on AppConfig.Routes means nil and missing
+// produce identical wire output.
+func BuildAppConfig(
+	deploymentID, deploymentHash string,
+	env map[string]string,
+	allowlist []string,
+	maxMemoryMB int,
+	routes ...DeploymentRoute,
+) AppConfig {
+	cfg := AppConfig{
+		DeploymentID:   deploymentID,
+		DeploymentHash: deploymentHash,
+		Env:            env,
+		Allowlist:      allowlist,
+		MaxMemoryMB:    maxMemoryMB,
+	}
+	if len(routes) > 0 {
+		cfg.Routes = routes
+	}
+	return cfg
 }
 
 // MockPublisher is a no-op publisher for development.

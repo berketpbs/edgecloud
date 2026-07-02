@@ -8,6 +8,7 @@ import (
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 )
 
 // ActiveDeploymentRepository handles active deployment mappings.
@@ -260,6 +261,59 @@ func (r *ActiveDeploymentRepository) ListByTenant(ctx context.Context, tenantID 
 	return ads, err
 }
 
+// JoinedActiveDeployment pairs an active_deployments row with its
+// referenced deployments row's `hash` and `regions` columns. The
+// ReconcileService uses this to fan out per-(tenant, app) in a single
+// round trip instead of an N+1 (one active-list + M deployment
+// lookups + M env lists). See ReconcileService.reconcileTenant /
+// BuildFullSync.
+//
+// Hash is sql.NullString (not plain string) because the LEFT JOIN
+// passes SQL NULL through for orphan rows — an active row whose
+// deployment_id no longer exists in the deployments table. The
+// service layer uses Hash.Valid (or equivalently, the absence of a
+// non-empty Hash.String) to detect orphans and skip them, logging
+// the count so operator-actionable broken-state is visible instead
+// of being silently dropped (which is what the previous INNER JOIN
+// did).
+type JoinedActiveDeployment struct {
+	domain.ActiveDeployment
+	Hash    sql.NullString `db:"hash"`
+	Regions pq.StringArray `db:"regions"`
+}
+
+// ListByTenantWithDeployment returns one row per active deployment
+// for the tenant, with the deployment's hash and regions joined in.
+//
+//	SELECT ad.*, d.hash, d.regions
+//	FROM active_deployments ad
+//	LEFT JOIN deployments d ON d.id = ad.deployment_id
+//	WHERE ad.tenant_id = $1
+//
+// LEFT JOIN semantics (was INNER JOIN in the earlier draft): an
+// active row whose referenced deployment_id no longer exists is
+// returned with Hash="" and Regions=nil. Calling code skips the
+// publish step for those rows and surfaces the count to the operator
+// so the broken (active, missing-deployment) pair isn't silently
+// dropped — the operator must resolve it (re-activate or delete the
+// active row). The previous log-and-continue on this case in the
+// pre-N+1 reconcile loop is preserved here, just centralised at the
+// service layer.
+func (r *ActiveDeploymentRepository) ListByTenantWithDeployment(ctx context.Context, tenantID string) ([]JoinedActiveDeployment, error) {
+	var rows []JoinedActiveDeployment
+	query := `
+		SELECT ad.tenant_id, ad.app_name, ad.deployment_id, ad.last_good_deployment_id,
+		       ad.auto_rollback_enabled, ad.stable_since, ad.regions_published,
+		       ad.regions_failed, ad.last_publish_at, ad.last_publish_attempt_id,
+		       d.hash, d.regions
+		FROM active_deployments ad
+		LEFT JOIN deployments d ON d.id = ad.deployment_id
+		WHERE ad.tenant_id = $1
+	`
+	err := r.db.SelectContext(ctx, &rows, query, tenantID)
+	return rows, err
+}
+
 // AppendRegionsPublished atomically merges `regions` into the
 // `regions_published` array on the (tenant, app) active row, AND
 // removes them from `regions_failed` (a region that succeeds on
@@ -323,4 +377,16 @@ func (r *ActiveDeploymentRepository) AppendRegionsFailed(ctx context.Context, te
 	regionsArr := domain.StringArrayFrom(regions)
 	_, err := r.db.ExecContext(ctx, query, tenantID, appName, regionsArr, ts, attemptID)
 	return err
+}
+
+// Count returns the fleet-wide count of active_deployments rows.
+// The autoscaler (issue #85) uses this to compute its target
+// headroom — every region sizes its own fleet against the same
+// DesiredApps value because the deployment table is global
+// (region lives on workers, not on deployments). Multi-region
+// partitioning is a separate concern.
+func (r *ActiveDeploymentRepository) Count(ctx context.Context) (int, error) {
+	var count int
+	err := r.db.GetContext(ctx, &count, `SELECT COUNT(*) FROM active_deployments`)
+	return count, err
 }
