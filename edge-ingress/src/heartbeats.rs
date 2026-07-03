@@ -241,6 +241,7 @@ mod tests {
             region: "fra".to_string(),
             worker_addr: Some(worker_addr.to_string()),
             apps,
+            cluster_headroom: None,
         }
     }
 
@@ -252,6 +253,7 @@ mod tests {
             region: "fra".to_string(),
             worker_addr: None,
             apps,
+            cluster_headroom: None,
         }
     }
 
@@ -285,6 +287,7 @@ mod tests {
             region: "fra".to_string(),
             worker_addr: Some(String::new()),
             apps,
+            cluster_headroom: None,
         };
 
         let changed = apply_heartbeat(&table, &hb).await;
