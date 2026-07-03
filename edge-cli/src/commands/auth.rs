@@ -7,9 +7,9 @@ use clap::Subcommand;
 use std::env;
 use std::io::{IsTerminal, Read};
 
-use crate::api::{ApiClient, ApiError};
 #[cfg(test)]
 use crate::api::APIKeySummary;
+use crate::api::{ApiClient, ApiError};
 use crate::config::{load_api_url, ApiKey};
 use crate::output;
 
