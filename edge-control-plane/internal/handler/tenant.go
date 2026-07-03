@@ -80,6 +80,9 @@ func (h *TenantHandler) Bootstrap(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Bootstrap tenant: failed to encode response: %v", err)
 	}
 	auditRecord(r, "bootstrap", "tenant", tenant.ID, "tenant "+tenant.ID+" created via self-signup", "success")
+	if DefaultTenantCreationLimiter != nil {
+		DefaultTenantCreationLimiter.Record(service.StripPort(r.RemoteAddr))
+	}
 }
 
 func (h *TenantHandler) Create(w http.ResponseWriter, r *http.Request) {

@@ -173,8 +173,10 @@ func New(
 	// Tenant rate limiter: applied after auth on all /api/v1/* routes.
 	// Zero-value configs use defaults set in config.Load().
 	tenantLimiter := middleware.NewRateLimiter(cfg.RateLimit.TenantRate, cfg.RateLimit.TenantBurst)
-	// IP rate limiter: applied on unauthenticated public endpoints.
-	ipLimiter := middleware.NewRateLimiter(cfg.RateLimit.IPRate, cfg.RateLimit.IPBurst)
+	// Bootstrap rate limiter: tight limit for self-signup abuse prevention.
+	bootstrapLimiter := middleware.NewRateLimiter(2, 5)
+	// Tenant creation limiter: per-IP cap (10 per hour) to prevent DB fill.
+	handler.DefaultTenantCreationLimiter = middleware.NewTenantCreationLimiter(10, 1*time.Hour)
 
 	// ── Router ────────────────────────────────────────────────────
 	mux := http.NewServeMux()
@@ -231,8 +233,11 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	})
 
 	// Public endpoints (no auth required) — IP rate limited
-	mux.Handle("POST /api/v1/tenants", ipLimiter.Middleware(middleware.ClientIP)(http.HandlerFunc(tenantHandler.Bootstrap)))
-	mux.Handle("POST /api/v1/keys", ipLimiter.Middleware(middleware.ClientIP)(http.HandlerFunc(apiKeyHandler.Create)))
+	mux.Handle("POST /api/v1/tenants",
+		handler.DefaultTenantCreationLimiter.Middleware(
+			bootstrapLimiter.Middleware(middleware.ClientIP)(
+				http.HandlerFunc(tenantHandler.Bootstrap)),
+		))
 
 	// Deprecated: redirect old /api/... paths to /api/v1/... for clients still
 	// on the old contract. Workers use /api/internal/... (unversioned).
@@ -248,6 +253,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	mux.HandleFunc("GET /api/tenants", redirectTo("/api/v1/tenants"))
 	mux.HandleFunc("POST /api/tenants", redirectTo("/api/v1/tenants"))
 	mux.HandleFunc("GET /api/keys", redirectTo("/api/v1/keys"))
+	mux.HandleFunc("POST /api/keys", redirectTo("/api/v1/keys"))
 	mux.HandleFunc("DELETE /api/keys/{keyID}", redirectTo("/api/v1/keys/"+"{keyID}"))
 	mux.HandleFunc("PUT /api/keys/{keyID}", redirectTo("/api/v1/keys/"+"{keyID}"))
 	mux.HandleFunc("GET /api/apps", redirectTo("/api/v1/apps"))
