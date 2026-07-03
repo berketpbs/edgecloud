@@ -11,6 +11,10 @@ import (
 // Set once at startup in app.go. Read by the auditRecord helper.
 var DefaultAuditor *service.Auditor
 
+// DefaultTenantCreationLimiter limits tenant creation per IP.
+// Set once at startup in app.go. Read by the Bootstrap handler.
+var DefaultTenantCreationLimiter *middleware.TenantCreationLimiter
+
 // auditRecord records an audit event using context extracted from the request.
 // No-op when DefaultAuditor is nil (safe for tests).
 func auditRecord(r *http.Request, action, resource, resourceID, details, outcome string) {
