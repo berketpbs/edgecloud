@@ -103,12 +103,12 @@ func New(
 	)
 
 	// Wire secrets encryption (if configured).
-	secretsEnc, encErr := service.NewSecretEncrypter(cfg.SecretsMasterKey)
+	secretsEnc, encErr := service.NewSecretEncryptor(cfg.SecretsMasterKey)
 	if encErr != nil {
-		log.Fatalf("failed to create secrets encrypter: %v", encErr)
+		log.Fatalf("failed to create secrets encryptor: %v", encErr)
 	}
 	if secretsEnc != nil {
-		envSvc.SetSecretEncrypter(secretsEnc)
+		envSvc.SetSecretEncryptor(secretsEnc)
 		deploymentSvc.SetEnvService(envSvc)
 		trafficSvc.SetEnvDecrypter(secretsEnc)
 		reconcileSvc.SetEnvDecrypter(secretsEnc)

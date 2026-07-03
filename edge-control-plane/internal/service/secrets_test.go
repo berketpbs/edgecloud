@@ -6,12 +6,12 @@ import (
 )
 
 func TestEncryptDecrypt_RoundTrip(t *testing.T) {
-	sec, err := NewSecretEncrypter(testMasterKey)
+	sec, err := NewSecretEncryptor(testMasterKey)
 	if err != nil {
-		t.Fatalf("NewSecretEncrypter: %v", err)
+		t.Fatalf("NewSecretEncryptor: %v", err)
 	}
 	if sec == nil {
-		t.Fatal("expected non-nil encrypter")
+		t.Fatal("expected non-nil encryptor")
 	}
 
 	plaintext := "DATABASE_URL=postgres://user:pass@host:5432/db"
@@ -37,9 +37,9 @@ func TestEncryptDecrypt_RoundTrip(t *testing.T) {
 }
 
 func TestEncryptDecrypt_MultipleValues(t *testing.T) {
-	sec, err := NewSecretEncrypter(testMasterKey)
+	sec, err := NewSecretEncryptor(testMasterKey)
 	if err != nil || sec == nil {
-		t.Fatalf("NewSecretEncrypter: %v", err)
+		t.Fatalf("NewSecretEncryptor: %v", err)
 	}
 
 	values := []string{
@@ -65,9 +65,9 @@ func TestEncryptDecrypt_MultipleValues(t *testing.T) {
 }
 
 func TestDecrypt_LegacyPlaintext(t *testing.T) {
-	sec, err := NewSecretEncrypter(testMasterKey)
+	sec, err := NewSecretEncryptor(testMasterKey)
 	if err != nil || sec == nil {
-		t.Fatalf("NewSecretEncrypter: %v", err)
+		t.Fatalf("NewSecretEncryptor: %v", err)
 	}
 
 	// Legacy DB value — no colon prefix
@@ -82,9 +82,9 @@ func TestDecrypt_LegacyPlaintext(t *testing.T) {
 }
 
 func TestDecrypt_PlaintextWithColon(t *testing.T) {
-	sec, err := NewSecretEncrypter(testMasterKey)
+	sec, err := NewSecretEncryptor(testMasterKey)
 	if err != nil || sec == nil {
-		t.Fatalf("NewSecretEncrypter: %v", err)
+		t.Fatalf("NewSecretEncryptor: %v", err)
 	}
 
 	// A plaintext that happens to contain ":" should still pass through
@@ -100,9 +100,9 @@ func TestDecrypt_PlaintextWithColon(t *testing.T) {
 }
 
 func TestDecrypt_TamperedCiphertext(t *testing.T) {
-	sec, err := NewSecretEncrypter(testMasterKey)
+	sec, err := NewSecretEncryptor(testMasterKey)
 	if err != nil || sec == nil {
-		t.Fatalf("NewSecretEncrypter: %v", err)
+		t.Fatalf("NewSecretEncryptor: %v", err)
 	}
 
 	enc, err := sec.Encrypt("sensitive")
@@ -121,10 +121,10 @@ func TestDecrypt_TamperedCiphertext(t *testing.T) {
 }
 
 func TestDecrypt_WrongKey(t *testing.T) {
-	sec1, _ := NewSecretEncrypter(testMasterKey)
-	sec2, err := NewSecretEncrypter("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	sec1, _ := NewSecretEncryptor(testMasterKey)
+	sec2, err := NewSecretEncryptor("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
 	if err != nil || sec2 == nil {
-		t.Fatalf("NewSecretEncrypter(sec2): %v", err)
+		t.Fatalf("NewSecretEncryptor(sec2): %v", err)
 	}
 
 	enc, err := sec1.Encrypt("my-api-key")
@@ -138,47 +138,47 @@ func TestDecrypt_WrongKey(t *testing.T) {
 	}
 }
 
-func TestEncrypt_NilEncrypter_Noop(t *testing.T) {
-	var sec *SecretEncrypter
+func TestEncrypt_NilEncryptor_Noop(t *testing.T) {
+	var sec *SecretEncryptor
 	out, err := sec.Encrypt("plaintext")
 	if err != nil {
 		t.Fatalf("Encrypt(nil): %v", err)
 	}
 	if out != "plaintext" {
-		t.Errorf("nil encrypter must pass through, got %q", out)
+		t.Errorf("nil encryptor must pass through, got %q", out)
 	}
 }
 
-func TestDecrypt_NilEncrypter_Noop(t *testing.T) {
-	var sec *SecretEncrypter
+func TestDecrypt_NilEncryptor_Noop(t *testing.T) {
+	var sec *SecretEncryptor
 	out, err := sec.Decrypt("ciphertext")
 	if err != nil {
 		t.Fatalf("Decrypt(nil): %v", err)
 	}
 	if out != "ciphertext" {
-		t.Errorf("nil encrypter must pass through, got %q", out)
+		t.Errorf("nil encryptor must pass through, got %q", out)
 	}
 }
 
-func TestNewSecretEncrypter_EmptyKey(t *testing.T) {
-	sec, err := NewSecretEncrypter("")
+func TestNewSecretEncryptor_EmptyKey(t *testing.T) {
+	sec, err := NewSecretEncryptor("")
 	if err != nil {
-		t.Fatalf("NewSecretEncrypter(''): %v", err)
+		t.Fatalf("NewSecretEncryptor(''): %v", err)
 	}
 	if sec != nil {
-		t.Error("empty key should return nil encrypter")
+		t.Error("empty key should return nil encryptor")
 	}
 }
 
-func TestNewSecretEncrypter_ShortKey(t *testing.T) {
-	_, err := NewSecretEncrypter("abcd1234")
+func TestNewSecretEncryptor_ShortKey(t *testing.T) {
+	_, err := NewSecretEncryptor("abcd1234")
 	if err == nil {
 		t.Fatal("expected error for short key, got nil")
 	}
 }
 
-func TestNewSecretEncrypter_NonHexKey(t *testing.T) {
-	_, err := NewSecretEncrypter(strings.Repeat("z", 64))
+func TestNewSecretEncryptor_NonHexKey(t *testing.T) {
+	_, err := NewSecretEncryptor(strings.Repeat("z", 64))
 	if err == nil {
 		t.Fatal("expected error for non-hex key, got nil")
 	}

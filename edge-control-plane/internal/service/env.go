@@ -18,22 +18,22 @@ type EnvRepoInterface interface {
 // EnvService handles environment variable business logic.
 type EnvService struct {
 	appEnvRepo EnvRepoInterface
-	encrypter  *SecretEncrypter // nil = encryption disabled (dev mode)
+	encryptor  *SecretEncryptor // nil = encryption disabled (dev mode)
 }
 
 func NewEnvService(appEnvRepo EnvRepoInterface) *EnvService {
 	return &EnvService{appEnvRepo: appEnvRepo}
 }
 
-// SetSecretEncrypter sets the encrypter after construction.
+// SetSecretEncryptor sets the encryptor after construction.
 // Returns the receiver so it can be chained.
-func (s *EnvService) SetSecretEncrypter(sec *SecretEncrypter) *EnvService {
-	s.encrypter = sec
+func (s *EnvService) SetSecretEncryptor(sec *SecretEncryptor) *EnvService {
+	s.encryptor = sec
 	return s
 }
 
 func (s *EnvService) SetEnv(ctx context.Context, tenantID, appName, key, value string) error {
-	encrypted, err := s.encrypter.Encrypt(value)
+	encrypted, err := s.encryptor.Encrypt(value)
 	if err != nil {
 		return fmt.Errorf("encrypting env value: %w", err)
 	}
@@ -51,7 +51,7 @@ func (s *EnvService) ListEnv(ctx context.Context, tenantID, appName string) ([]d
 		return nil, err
 	}
 	for i := range rows {
-		decrypted, err := s.encrypter.Decrypt(rows[i].EnvValue)
+		decrypted, err := s.encryptor.Decrypt(rows[i].EnvValue)
 		if err != nil {
 			return nil, fmt.Errorf("decrypting env %s: %w", rows[i].EnvKey, err)
 		}
@@ -64,10 +64,10 @@ func (s *EnvService) DeleteEnv(ctx context.Context, tenantID, appName, key strin
 	return s.appEnvRepo.Delete(ctx, tenantID, appName, key)
 }
 
-// Decrypt is a pass-through to the encrypter. Used by publish call sites
+// Decrypt is a pass-through to the encryptor. Used by publish call sites
 // that read env vars from the repo directly and need to decrypt inline.
 func (s *EnvService) Decrypt(value string) (string, error) {
-	return s.encrypter.Decrypt(value)
+	return s.encryptor.Decrypt(value)
 }
 
 // DecryptEnvMap fetches env vars for an app and returns a decrypted map.
@@ -79,7 +79,7 @@ func (s *EnvService) DecryptEnvMap(ctx context.Context, tenantID, appName string
 	}
 	out := make(map[string]string, len(rows))
 	for _, r := range rows {
-		v, err := s.encrypter.Decrypt(r.EnvValue)
+		v, err := s.encryptor.Decrypt(r.EnvValue)
 		if err != nil {
 			return nil, fmt.Errorf("decrypting env %s: %w", r.EnvKey, err)
 		}
@@ -97,7 +97,7 @@ func (s *EnvService) DecryptEnvMapBulk(ctx context.Context, tenantID string, app
 	}
 	out := make(map[string]map[string]string)
 	for _, r := range rows {
-		v, err := s.encrypter.Decrypt(r.EnvValue)
+		v, err := s.encryptor.Decrypt(r.EnvValue)
 		if err != nil {
 			return nil, fmt.Errorf("decrypting env %s/%s: %w", r.AppName, r.EnvKey, err)
 		}

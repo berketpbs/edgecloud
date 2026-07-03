@@ -9,17 +9,17 @@ import (
 	"strings"
 )
 
-// SecretEncrypter encrypts and decrypts secret values using AES-256-GCM.
-// A nil or zero-value SecretEncrypter is a no-op: Encrypt/Decrypt return
+// SecretEncryptor encrypts and decrypts secret values using AES-256-GCM.
+// A nil or zero-value SecretEncryptor is a no-op: Encrypt/Decrypt return
 // the value unchanged. This lets development setups run without a master key
 // while production enforces one.
-type SecretEncrypter struct {
+type SecretEncryptor struct {
 	key []byte // 32 bytes for AES-256
 }
 
-// NewSecretEncrypter creates an encrypter from a hex-encoded 32-byte key.
+// NewSecretEncryptor creates an encryptor from a hex-encoded 32-byte key.
 // Returns nil (no-op) when keyHex is empty.
-func NewSecretEncrypter(keyHex string) (*SecretEncrypter, error) {
+func NewSecretEncryptor(keyHex string) (*SecretEncryptor, error) {
 	if keyHex == "" {
 		return nil, nil
 	}
@@ -30,13 +30,13 @@ func NewSecretEncrypter(keyHex string) (*SecretEncrypter, error) {
 	if len(key) != 32 {
 		return nil, fmt.Errorf("secrets key must be 32 bytes (64 hex chars), got %d bytes", len(key))
 	}
-	return &SecretEncrypter{key: key}, nil
+	return &SecretEncryptor{key: key}, nil
 }
 
 // Encrypt encrypts plaintext with AES-256-GCM and returns it as
 // "<hex-nonce>:<hex-ciphertext+tag>". Returns plaintext unchanged when sec
 // is nil or empty (encryption disabled — development mode).
-func (sec *SecretEncrypter) Encrypt(plaintext string) (string, error) {
+func (sec *SecretEncryptor) Encrypt(plaintext string) (string, error) {
 	if sec == nil || len(sec.key) == 0 {
 		return plaintext, nil
 	}
@@ -58,7 +58,7 @@ func (sec *SecretEncrypter) Encrypt(plaintext string) (string, error) {
 
 // Decrypt reverses Encrypt. Values without the "<hex>:" prefix (legacy
 // plaintext) are returned as-is. An empty or nil sec returns value unchanged.
-func (sec *SecretEncrypter) Decrypt(value string) (string, error) {
+func (sec *SecretEncryptor) Decrypt(value string) (string, error) {
 	if sec == nil || len(sec.key) == 0 {
 		return value, nil
 	}

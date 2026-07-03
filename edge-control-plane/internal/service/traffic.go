@@ -34,7 +34,7 @@ type TrafficEnvRepoInterface interface {
 	List(ctx context.Context, tenantID, appName string) ([]domain.AppEnv, error)
 }
 
-// TrafficEnvDecrypter is the subset of SecretEncrypter used by TrafficService.
+// TrafficEnvDecrypter is the subset of SecretEncryptor used by TrafficService.
 // Injected via SetEnvDecrypter. When nil, env values pass through as plaintext.
 type TrafficEnvDecrypter interface {
 	Decrypt(value string) (string, error)

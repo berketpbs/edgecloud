@@ -954,11 +954,11 @@ func (s *DeploymentService) RepublishActiveDeployments(ctx context.Context, tena
 		for _, e := range envs {
 			v := e.EnvValue
 			if s.envSvc != nil {
-				v, err = s.envSvc.Decrypt(e.EnvValue)
-				if err != nil {
-					log.Printf("republish: decrypting env %s/%s: %v", ad.AppName, e.EnvKey, err)
+				var decErr error
+				v, decErr = s.envSvc.Decrypt(e.EnvValue)
+				if decErr != nil {
+					log.Printf("republish: decrypting env %s/%s: %v", ad.AppName, e.EnvKey, decErr)
 					failedApps = append(failedApps, ad.AppName)
-					err = nil // reset for next iteration
 					break
 				}
 			}

@@ -46,8 +46,8 @@ func TestEnvService_SetEnv(t *testing.T) {
 		},
 	}
 	svc := newEnvSvc(repo)
-	sec, _ := NewSecretEncrypter(testMasterKey)
-	svc.SetSecretEncrypter(sec)
+	sec, _ := NewSecretEncryptor(testMasterKey)
+	svc.SetSecretEncryptor(sec)
 
 	if err := svc.SetEnv(context.Background(), "t_1", "hello", "LOG_LEVEL", "debug"); err != nil {
 		t.Fatalf("SetEnv: %v", err)
@@ -66,7 +66,7 @@ func TestEnvService_SetEnv(t *testing.T) {
 	}
 }
 
-func TestEnvService_SetEnv_NoEncrypter_StoresPlaintext(t *testing.T) {
+func TestEnvService_SetEnv_NoEncryptor_StoresPlaintext(t *testing.T) {
 	var capturedValue string
 	repo := &mockEnvRepo{
 		setFn: func(ctx context.Context, env *domain.AppEnv) error {
@@ -74,18 +74,18 @@ func TestEnvService_SetEnv_NoEncrypter_StoresPlaintext(t *testing.T) {
 			return nil
 		},
 	}
-	svc := newEnvSvc(repo) // no encrypter set
+	svc := newEnvSvc(repo) // no encryptor set
 
 	if err := svc.SetEnv(context.Background(), "t_1", "hello", "K", "plaintext"); err != nil {
 		t.Fatalf("SetEnv: %v", err)
 	}
 	if capturedValue != "plaintext" {
-		t.Errorf("without encrypter, value must be stored as-is; got %q", capturedValue)
+		t.Errorf("without encryptor, value must be stored as-is; got %q", capturedValue)
 	}
 }
 
 func TestEnvService_ListEnv_Decrypts(t *testing.T) {
-	sec, _ := NewSecretEncrypter(testMasterKey)
+	sec, _ := NewSecretEncryptor(testMasterKey)
 	encrypted, _ := sec.Encrypt("secret-value")
 
 	repo := &mockEnvRepo{
@@ -96,7 +96,7 @@ func TestEnvService_ListEnv_Decrypts(t *testing.T) {
 		},
 	}
 	svc := newEnvSvc(repo)
-	svc.SetSecretEncrypter(sec)
+	svc.SetSecretEncryptor(sec)
 
 	envs, err := svc.ListEnv(context.Background(), "t_1", "hello")
 	if err != nil {
@@ -111,7 +111,7 @@ func TestEnvService_ListEnv_Decrypts(t *testing.T) {
 }
 
 func TestEnvService_ListEnv_LegacyPlaintext(t *testing.T) {
-	sec, _ := NewSecretEncrypter(testMasterKey)
+	sec, _ := NewSecretEncryptor(testMasterKey)
 
 	repo := &mockEnvRepo{
 		listFn: func(ctx context.Context, tenantID, appName string) ([]domain.AppEnv, error) {
@@ -121,7 +121,7 @@ func TestEnvService_ListEnv_LegacyPlaintext(t *testing.T) {
 		},
 	}
 	svc := newEnvSvc(repo)
-	svc.SetSecretEncrypter(sec)
+	svc.SetSecretEncryptor(sec)
 
 	envs, err := svc.ListEnv(context.Background(), "t_1", "hello")
 	if err != nil {
@@ -133,7 +133,7 @@ func TestEnvService_ListEnv_LegacyPlaintext(t *testing.T) {
 }
 
 func TestEnvService_DecryptEnvMap(t *testing.T) {
-	sec, _ := NewSecretEncrypter(testMasterKey)
+	sec, _ := NewSecretEncryptor(testMasterKey)
 	enc, _ := sec.Encrypt("db-pass")
 
 	repo := &mockEnvRepo{
@@ -144,7 +144,7 @@ func TestEnvService_DecryptEnvMap(t *testing.T) {
 		},
 	}
 	svc := newEnvSvc(repo)
-	svc.SetSecretEncrypter(sec)
+	svc.SetSecretEncryptor(sec)
 
 	m, err := svc.DecryptEnvMap(context.Background(), "t_1", "hello")
 	if err != nil {
@@ -156,7 +156,7 @@ func TestEnvService_DecryptEnvMap(t *testing.T) {
 }
 
 func TestEnvService_DecryptEnvMapBulk(t *testing.T) {
-	sec, _ := NewSecretEncrypter(testMasterKey)
+	sec, _ := NewSecretEncryptor(testMasterKey)
 	encA, _ := sec.Encrypt("secret-a")
 	encB, _ := sec.Encrypt("secret-b")
 
@@ -169,7 +169,7 @@ func TestEnvService_DecryptEnvMapBulk(t *testing.T) {
 		},
 	}
 	svc := newEnvSvc(repo)
-	svc.SetSecretEncrypter(sec)
+	svc.SetSecretEncryptor(sec)
 
 	m, err := svc.DecryptEnvMapBulk(context.Background(), "t_1", []string{"app-a", "app-b"})
 	if err != nil {
