@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"regexp"
@@ -12,6 +13,17 @@ import (
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
+)
+
+// Sentinel errors used by the tenant service. Handlers use errors.Is to
+// translate these into HTTP status codes (400 for validation, 404 for
+// missing rows, 500 otherwise). ErrTenantNotFound is the canonical
+// "tenant row not present" sentinel for the tenant CRUD path; the
+// reconcile package's older sentinel has been renamed to
+// ErrTenantNotFoundInReconcile so this name is free.
+var (
+	ErrTenantNotFound = errors.New("tenant not found")
+	ErrQuotaNotFound  = errors.New("quota not found for tenant")
 )
 
 // MaxEgressAllowlistEntries is the maximum number of entries a tenant may specify.
@@ -227,44 +239,51 @@ func (s *TenantService) UpdateTenant(ctx context.Context, t *domain.Tenant) erro
 // row is left untouched (useful when an admin has hand-tuned per-tenant limits
 // and only wants to flip the plan label).
 //
-// Returns domain.ErrUnknownPlan when newPlan is not a known tier.
+// Returns domain.ErrUnknownPlan when newPlan is not a known tier,
+// ErrTenantNotFound / ErrQuotaNotFound when the corresponding row is
+// missing — both mappable to HTTP 404 by the handler.
 func (s *TenantService) UpdateTenantPlan(ctx context.Context, tenantID, newPlan string, applyQuotaDefaults bool) error {
 	if !domain.IsValidPlan(newPlan) {
 		return fmt.Errorf("%w: %q", domain.ErrUnknownPlan, newPlan)
 	}
 
-	tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
-	if err != nil {
-		return fmt.Errorf("getting tenant: %w", err)
-	}
-	if tenant == nil {
-		return fmt.Errorf("tenant not found")
-	}
-	tenant.Plan = newPlan
-	if err := s.tenantRepo.Update(ctx, tenant); err != nil {
-		return fmt.Errorf("updating tenant: %w", err)
-	}
+	return repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
+		tenantRepo := s.tenantRepo.WithTx(tx)
+		quotaRepo := s.quotaRepo.WithTx(tx)
 
-	if !applyQuotaDefaults {
+		tenant, err := tenantRepo.GetByID(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("getting tenant: %w", err)
+		}
+		if tenant == nil {
+			return ErrTenantNotFound
+		}
+		tenant.Plan = newPlan
+		if err := tenantRepo.Update(ctx, tenant); err != nil {
+			return fmt.Errorf("updating tenant: %w", err)
+		}
+
+		if !applyQuotaDefaults {
+			return nil
+		}
+
+		quota, err := quotaRepo.GetByTenantID(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("getting quota: %w", err)
+		}
+		if quota == nil {
+			return ErrQuotaNotFound
+		}
+		newDefaults, err := domain.QuotaForPlan(newPlan)
+		if err != nil {
+			return err
+		}
+		newDefaults.TenantID = tenantID
+		if err := quotaRepo.Update(ctx, &newDefaults); err != nil {
+			return fmt.Errorf("updating quota: %w", err)
+		}
 		return nil
-	}
-
-	quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
-	if err != nil {
-		return fmt.Errorf("getting quota: %w", err)
-	}
-	if quota == nil {
-		return fmt.Errorf("quota not found for tenant")
-	}
-	newDefaults, err := domain.QuotaForPlan(newPlan)
-	if err != nil {
-		return err
-	}
-	newDefaults.TenantID = tenantID
-	if err := s.quotaRepo.Update(ctx, &newDefaults); err != nil {
-		return fmt.Errorf("updating quota: %w", err)
-	}
-	return nil
+	})
 }
 
 func (s *TenantService) DeleteTenant(ctx context.Context, id string) error {
