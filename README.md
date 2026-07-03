@@ -2,16 +2,16 @@
 
 > Multi-tenant Wasm edge runtime — Rust supervisor, Rust ingress, Go control plane.
 >
-> Status: edgeCloud is in active development. See [whitepaper.md](./whitepaper.md) for design intent (Draft v0.1, 2026-06-14).
+> Status: edgeCloud is in active development. See [whitepaper.md](./whitepaper.md) for design intent.
 
 ## Binaries
 
 | Binary | Source | Role |
 |---|---|---|
-| `edge` | `edge-cli/src/main.rs` (clap `name = "edge"`) | Developer CLI. Subcommands include `deploy`, `build`, `init`, `migrate`, and `activate`. |
+| `edge-cli` | `edge-cli/src/main.rs` (clap `name = "edge"` — invoked as `edge`) | Developer CLI for tenants — deploy, activate, manage apps, inspect state. |
 | `edge-worker` | `edge-worker/src/main.rs` | Rust supervisor — pulls artifacts, hosts Wasmtime instances, publishes heartbeats. |
 | `edge-ingress` | `edge-ingress/src/main.rs` | Public ingress — terminates TLS, maintains a routing table by tenant and app. |
-| `edge-migrate` | `edge-migrate/edge-migrate-bin/src/main.rs` | Standalone source-to-source migrator — the tool the Go control plane shells out to per `edge-migrate/docs/design.md` v0.3. |
+| `edge-migrate` | `edge-migrate/edge-migrate-bin/src/main.rs` | Standalone source-to-source migrator — the tool the Go control plane shells out to per [edge-migrate/docs/design.md](./edge-migrate/docs/design.md). |
 | `api` | `edge-control-plane/cmd/api/main.go` | Go control plane — HTTP API for tenants and operators. |
 | `migrate` | `edge-control-plane/cmd/migrate/main.go` | Go DB migrator — schema migrations for the control plane. |
 
@@ -23,14 +23,14 @@
        │ edge deploy / activate                 │
        ▼                                       ▼
 +------------------------+            +------------------------+
-| edge  (CLI)            |            | edge-ingress  (Rust)   |
+| edge-cli  (CLI)        |            | edge-ingress  (Rust)   |
 | edge-cli/              |            | edge-ingress/          |
 +-----------+------------+            +-----------+------------+
             │                                     │
             │ POST /api/deploy, ...               │ forward
             ▼                                     ▼
 +------------------------+            +------------------------+
-| api  (Go control plane)│◀──heartbeat▶│ edge-worker  (Rust)   |
+| api  (Go control plane)│◀──heartbeat──│ edge-worker  (Rust)   |
 | edge-control-plane/    │   ──NATSTask▶│ edge-worker/          |
 |   cmd/api/             │              | -- Wasmtime host      |
 +----------+-------------+              +-----------+-----------+
@@ -57,10 +57,9 @@ Internal crates (no user-facing binary):
 
 ¹ edge-test-helpers lives outside the Cargo workspace — dev-only
   test harness, never linked into prod binaries.
-² edge-migrate-lib is bundled inside edge-migrate (the bin
-  depends on it with `features = ["rust"]`); it appears in
-  the workspace so the C-only feature gate keeps the lib's
-  footprint zero when the Rust path is disabled.
+² edge-migrate-lib — workspace member; the bin forces
+  `features = ["rust"]` on it, so the C-only path is only
+  exercised by direct library consumers.
 ```
 
 ## Build
@@ -80,15 +79,15 @@ cargo test --workspace                             # Rust unit tests
 (cd edge-control-plane && go test ./...)           # Go unit tests
 ```
 
-Integration tests in `edge-worker/tests/` need Docker (testcontainers + wiremock) and self-skip when `CI=true` or `SKIP_INTEGRATION_TESTS=1`. See [CLAUDE.md](./CLAUDE.md#build--test).
+Integration tests self-skip without Docker — see [CLAUDE.md](./CLAUDE.md#build--test) for flags.
 
 ## Docs
 
 | File | Role |
 |---|---|
-| [whitepaper.md](./whitepaper.md) | Design intent — 13-section architecture, deployment artifact format, security model, roadmap. Status: Draft v0.1, 2026-06-14. |
+| [whitepaper.md](./whitepaper.md) | Design intent — 13-section architecture, deployment artifact format, security model, roadmap. |
 | [CLAUDE.md](./CLAUDE.md) | Build/test commands, lint, per-crate gotchas, integration-test flags. (Written for AI agents, equally useful for humans hacking on the repo.) |
-| [edge-migrate/docs/design.md](./edge-migrate/docs/design.md) | Migration spec v0.3 — transformation rules, AST contracts, C preprocessor handling. |
+| [edge-migrate/docs/design.md](./edge-migrate/docs/design.md) | Migration spec — transformation rules, AST contracts, C preprocessor handling. |
 | [edge-control-plane/docs/storage.md](./edge-control-plane/docs/storage.md) | Operator guide for the control-plane artifact-storage backends (`fs` / `s3` / `remote`). |
 | [edge-control-plane/docs/api/openapi.yaml](./edge-control-plane/docs/api/openapi.yaml) | OpenAPI 3 spec for the `api` binary's HTTP surface. |
 | [edge-ingress/README.md](./edge-ingress/README.md) | Operator runbook for `edge-ingress`. |
@@ -104,7 +103,7 @@ edgeCloud/
 ├── _typos.toml
 ├── whitepaper.md
 ├── CLAUDE.md
-├── edge-cli/               # → edge binary
+├── edge-cli/               # → edge-cli binary (invoked as edge)
 ├── edge-config/
 ├── edge-control-plane/     # Go module (cmd/api, cmd/migrate)
 ├── edge-ingress/           # → edge-ingress binary
