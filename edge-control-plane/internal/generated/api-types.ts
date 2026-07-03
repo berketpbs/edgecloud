@@ -543,6 +543,42 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/webhooks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List all webhooks for the authenticated tenant */
+        get: operations["listWebhooks"];
+        put?: never;
+        /** Create a new webhook subscription */
+        post: operations["createWebhook"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/webhooks/{webhookID}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Update a webhook subscription */
+        put: operations["updateWebhook"];
+        post?: never;
+        /** Delete a webhook subscription */
+        delete: operations["deleteWebhook"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/admin/tenants": {
         parameters: {
             query?: never;
@@ -921,6 +957,74 @@ export interface components {
              * @example viewer
              */
             role?: string;
+        };
+        CreateWebhookRequest: {
+            /**
+             * Format: uri
+             * @description HTTPS callback URL.
+             * @example https://hooks.example.com/deploy
+             */
+            url: string;
+            /**
+             * @description HMAC signing secret (min 16 chars).
+             * @example whsec_abc123def456
+             */
+            secret: string;
+            /**
+             * @description Event types that trigger this webhook.
+             * @example [
+             *       "deploy",
+             *       "activate"
+             *     ]
+             */
+            events: ("deploy" | "activate" | "rollback" | "auto_rollback")[];
+            /**
+             * @description Optional description.
+             * @example Production deploy notifications
+             */
+            description?: string;
+        };
+        Webhook: {
+            /** @example wh_abc123 */
+            id?: string;
+            /** @example t_abc123 */
+            tenant_id?: string;
+            /** @example https://hooks.example.com/deploy */
+            url?: string;
+            /**
+             * @example [
+             *       "deploy",
+             *       "activate"
+             *     ]
+             */
+            events?: string[];
+            /** @example Production deploy notifications */
+            description?: string;
+            /** @example true */
+            enabled?: boolean;
+            /**
+             * Format: date-time
+             * @example 2026-07-03T18:00:00Z
+             */
+            created_at?: string;
+        };
+        UpdateWebhookRequest: {
+            /**
+             * Format: uri
+             * @description HTTPS callback URL. Omit to leave unchanged.
+             */
+            url?: string;
+            /** @description New HMAC signing secret. Omit to leave unchanged. */
+            secret?: string;
+            /** @description Replace event types. Omit to leave unchanged. */
+            events?: string[];
+            /** @description Replace description. Omit to leave unchanged. */
+            description?: string;
+            /** @description Enable or disable. Omit to leave unchanged. */
+            enabled?: boolean;
+        };
+        WebhookListResponse: {
+            webhooks?: components["schemas"]["Webhook"][];
         };
         CreateAppRequest: {
             /**
@@ -2583,6 +2687,108 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+        };
+    };
+    listWebhooks: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description List of webhooks. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookListResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    createWebhook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateWebhookRequest"];
+            };
+        };
+        responses: {
+            /** @description Webhook created. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Webhook"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    updateWebhook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                webhookID: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateWebhookRequest"];
+            };
+        };
+        responses: {
+            /** @description Webhook updated. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Webhook"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    deleteWebhook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                webhookID: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Webhook deleted. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
         };
     };
     listTenants: {

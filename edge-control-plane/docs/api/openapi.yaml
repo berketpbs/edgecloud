@@ -212,6 +212,89 @@ components:
           description: "New role. Omit to leave unchanged. Valid roles: 'developer', 'owner', 'viewer'."
           example: viewer
 
+    CreateWebhookRequest:
+      type: object
+      required: [url, secret, events]
+      properties:
+        url:
+          type: string
+          format: uri
+          description: HTTPS callback URL.
+          example: https://hooks.example.com/deploy
+        secret:
+          type: string
+          description: HMAC signing secret (min 16 chars).
+          example: whsec_abc123def456
+        events:
+          type: array
+          items:
+            type: string
+            enum: [deploy, activate, rollback, auto_rollback]
+          description: Event types that trigger this webhook.
+          example: [deploy, activate]
+        description:
+          type: string
+          description: Optional description.
+          example: Production deploy notifications
+
+    Webhook:
+      type: object
+      properties:
+        id:
+          type: string
+          example: wh_abc123
+        tenant_id:
+          type: string
+          example: t_abc123
+        url:
+          type: string
+          example: https://hooks.example.com/deploy
+        events:
+          type: array
+          items:
+            type: string
+          example: [deploy, activate]
+        description:
+          type: string
+          example: Production deploy notifications
+        enabled:
+          type: boolean
+          example: true
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-07-03T18:00:00Z"
+
+    UpdateWebhookRequest:
+      type: object
+      properties:
+        url:
+          type: string
+          format: uri
+          description: HTTPS callback URL. Omit to leave unchanged.
+        secret:
+          type: string
+          description: New HMAC signing secret. Omit to leave unchanged.
+        events:
+          type: array
+          items:
+            type: string
+          description: Replace event types. Omit to leave unchanged.
+        description:
+          type: string
+          description: Replace description. Omit to leave unchanged.
+        enabled:
+          type: boolean
+          description: Enable or disable. Omit to leave unchanged.
+
+    WebhookListResponse:
+      type: object
+      properties:
+        webhooks:
+          type: array
+          items:
+            $ref: '#/components/schemas/Webhook'
+
     # -------------------------------------------------------------------------
     # Apps
     # -------------------------------------------------------------------------
@@ -2133,6 +2216,97 @@ paths:
                 type: string
         '401':
           $ref: '#/components/responses/Unauthorized'
+
+  # -------------------------------------------------------------------------
+  # Webhooks
+  # -------------------------------------------------------------------------
+  /api/v1/webhooks:
+    post:
+      operationId: createWebhook
+      summary: Create a new webhook subscription
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWebhookRequest'
+      responses:
+        '201':
+          description: Webhook created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Webhook'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    get:
+      operationId: listWebhooks
+      summary: List all webhooks for the authenticated tenant
+      responses:
+        '200':
+          description: List of webhooks.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/webhooks/{webhookID}:
+    put:
+      operationId: updateWebhook
+      summary: Update a webhook subscription
+      parameters:
+        - name: webhookID
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateWebhookRequest'
+      responses:
+        '200':
+          description: Webhook updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Webhook'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      operationId: deleteWebhook
+      summary: Delete a webhook subscription
+      parameters:
+        - name: webhookID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Webhook deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   # -------------------------------------------------------------------------
   # Admin: Tenants
