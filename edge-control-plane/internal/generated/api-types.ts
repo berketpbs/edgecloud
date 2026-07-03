@@ -132,7 +132,13 @@ export interface paths {
         };
         /** Get a specific app */
         get: operations["getApp"];
-        put?: never;
+        /**
+         * Update mutable fields of an app
+         * @description Updates the mutable fields (currently only `description`) of
+         *     an existing app. Nullable fields: omit the field or send `null`
+         *     to leave it unchanged; send `""` to clear it.
+         */
+        put: operations["updateApp"];
         /** Create a new app */
         post: operations["createApp"];
         delete?: never;
@@ -909,6 +915,14 @@ export interface components {
              * @example Main web app
              */
             description?: string;
+        };
+        UpdateAppRequest: {
+            /**
+             * @description New description. Send `null` or omit to leave unchanged.
+             *     Send `""` to clear the description.
+             * @example Updated description
+             */
+            description?: string | null;
         };
         App: {
             /** @example a_abc123 */
@@ -1765,6 +1779,37 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description App details. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["App"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    updateApp: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique name of the app within the tenant. */
+                appName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateAppRequest"];
+            };
+        };
+        responses: {
+            /** @description App updated. */
             200: {
                 headers: {
                     [name: string]: unknown;
