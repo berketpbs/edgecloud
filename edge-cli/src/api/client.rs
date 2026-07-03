@@ -277,6 +277,8 @@ pub struct LogListResponse {
     pub limit: u32,
     #[serde(default)]
     pub since: String,
+    #[serde(default)]
+    pub next_offset: Option<u32>,
 }
 
 /// Worker-reported status of one app, returned by
@@ -1048,6 +1050,7 @@ impl<'a> Logs<'a> {
         since_rfc3339: Option<&str>,
         level: Option<&str>,
         limit: Option<u32>,
+        offset: Option<u32>,
     ) -> Result<LogListResponse> {
         // Build the URL with optional query params locally, then
         // hand the formatted string to `get_json_anyhow` for the
@@ -1076,6 +1079,13 @@ impl<'a> Logs<'a> {
                 parsed
                     .query_pairs_mut()
                     .append_pair("limit", &n.to_string());
+            }
+        }
+        if let Some(n) = offset {
+            if n > 0 {
+                parsed
+                    .query_pairs_mut()
+                    .append_pair("offset", &n.to_string());
             }
         }
         let url = parsed.to_string();
