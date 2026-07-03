@@ -101,6 +101,19 @@ func New(
 	reconcileSvc := service.NewReconcileService(
 		tenantRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, publisher, cfg.Region,
 	)
+
+	// Wire secrets encryption (if configured).
+	secretsEnc, encErr := service.NewSecretEncrypter(cfg.SecretsMasterKey)
+	if encErr != nil {
+		log.Fatalf("failed to create secrets encrypter: %v", encErr)
+	}
+	if secretsEnc != nil {
+		envSvc.SetSecretEncrypter(secretsEnc)
+		deploymentSvc.SetEnvService(envSvc)
+		trafficSvc.SetEnvDecrypter(secretsEnc)
+		reconcileSvc.SetEnvDecrypter(secretsEnc)
+	}
+
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
 	logSvc := service.NewLogService(logEntryRepo)
 	domainSvc := service.NewDomainService(db, domainRepo, appRepo)
