@@ -5,7 +5,7 @@
 //! accepted request creates a fresh `wasmtime::Store<RuntimeState>`
 //! (via `ProxyPre::instantiate_async`) and drives the guest's
 //! `handle(req, out)` impl. Outbound HTTP calls go through
-//! `RuntimeState::send_request`, which is where `EgressPolicy::check`
+//! `state.http().hooks.send_request` (the `EgressHttpHooks` override), which is where `EgressPolicy::check`
 //! runs (Phase C-3).
 //!
 //! # Why hyper (not axum)
@@ -126,9 +126,6 @@ impl HandlerDispatch {
         epoch_tick_ms: u64,
         config: HandlerConfig,
     ) -> anyhow::Result<Self> {
-        // wasmtime 45 `Error` no longer implements `std::error::Error`, so
-        // `anyhow::Context::context` can't apply directly. Map to
-        // `anyhow::Error` first, preserving the source chain.
         let proxy_pre = HandlerProxyPre::new(instance_pre)
             .map_err(|e| anyhow::anyhow!("ProxyPre::new (component does not export wasi:http/incoming-handler): {e}"))?;
         // Defend against divide-by-zero: a misconfigured 0 tick would
@@ -390,21 +387,16 @@ impl HandlerDispatch {
         // declaration that maps `error-code` → `HttpError`.
         let (sender, receiver): (HandlerResponseSender, HandlerResponseReceiver) =
             tokio::sync::oneshot::channel();
-        // wasmtime 45 moved `new_incoming_request` / `new_response_outparam`
-        // off the `WasiHttpView` trait onto `WasiHttpCtxView`, so we go
-        // through `data_mut().http()` to get the view. The errors are
-        // `wasmtime::Error`, which no longer implements `std::error::Error`
-        // in wasmtime 45, so map to `anyhow::Error` directly.
         let req_handle = store
             .data_mut()
             .http()
             .new_incoming_request(Scheme::Http, req)
-            .map_err(|e| anyhow::anyhow!("new_incoming_request: {e}"))?;
+            .map_err(anyhow::Error::from)?;
         let out = store
             .data_mut()
             .http()
             .new_response_outparam(sender)
-            .map_err(|e| anyhow::anyhow!("new_response_outparam: {e}"))?;
+            .map_err(anyhow::Error::from)?;
 
         // Account the request before dispatching the guest. We
         // snapshot-and-subtract in the heartbeat loop, not here, so
@@ -421,9 +413,7 @@ impl HandlerDispatch {
             let proxy = proxy_pre
                 .instantiate_async(&mut store)
                 .await
-                .map_err(|e| anyhow::anyhow!("proxy_pre.instantiate_async: {e}"))?;
-            // call_handle returns `wasmtime::Result<()>`. wasmtime 45 Error
-            // does not implement `std::error::Error`, so map to anyhow.
+                .map_err(anyhow::Error::from)?;
             proxy
                 .wasi_http_incoming_handler()
                 .call_handle(store, req_handle, out)

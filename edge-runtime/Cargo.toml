@@ -8,7 +8,7 @@ description = "Wasmtime-based runtime exposing WASI Preview 2 host interfaces fo
 
 [dependencies]
 # Core wasmtime runtime
-wasmtime = { version = "=45.0.3", features = ["component-model", "async"] }
+wasmtime = { version = "=45.0.3", features = ["component-model", "async", "anyhow"] }
 wasmtime-wasi = { version = "=45.0.3" }
 # WASI HTTP host impls — gives us `WasiHttpView`, `ProxyPre`, and the
 # `add_to_linker_async` helper that wires wasi:http/io/clocks/random into

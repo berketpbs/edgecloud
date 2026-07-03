@@ -4,7 +4,7 @@
 //! worlds share the same `edge:cloud@0.2.0` import surface and the
 //! same `include wasi:cli/command@0.2.1` surface. The only difference
 //! between the two worlds is the `wasi:http/incoming-handler` *export*
-//! on the handler world, which `wasmtime_wasi_http::ProxyPre` routes
+//! on the handler world, which `wasmtime_wasi_http::p2::bindings::ProxyPre` routes
 //! against at *instantiation* time, not at linker-construction time.
 //! So one factory, parameterized on `engine`, is correct.
 //!
@@ -12,12 +12,12 @@
 //!
 //! See the module-level comment in `lib.rs`. In short: we do NOT let
 //! bindgen auto-register the wasi:* Host impls (which would require
-//! `RuntimeState` to implement 100+ `wasmtime_wasi::bindings::...::Host`
+//! `RuntimeState` to implement 100+ `wasmtime_wasi::p2::bindings::...::Host`
 //! methods directly — `wit-bindgen 0.51` doesn't auto-wrap in
 //! `WasiImpl`). Instead, the linker is built up in three explicit
 //! passes:
 //!
-//! 1. **`wasmtime_wasi::add_to_linker_async`** — registers every
+//! 1. **`wasmtime_wasi::p2::add_to_linker_async`** — registers every
 //!    `wasi:cli/command` import (`wasi:io/*`, `wasi:clocks/*`,
 //!    `wasi:filesystem/*`, `wasi:random/*`, `wasi:sockets/*`,
 //!    `wasi:cli/*`) via the canonical `WasiImpl<&mut T>` wrapper.
@@ -52,7 +52,7 @@ use wasmtime::Engine;
 /// Long-running components implement `_start` and self-host any TCP
 /// servers they need via `wasi:sockets` (registered via step 1).
 /// Handler components additionally export `wasi:http/incoming-handler`,
-/// which `wasmtime_wasi_http::ProxyPre` dispatches against at request
+/// which `wasmtime_wasi_http::p2::bindings::ProxyPre` dispatches against at request
 /// time — see `edge-worker/src/dispatch.rs`.
 pub fn create_component_linker(engine: &Engine) -> Result<ComponentLinker<RuntimeState>> {
     let mut linker: ComponentLinker<RuntimeState> = ComponentLinker::new(engine);
@@ -63,7 +63,8 @@ pub fn create_component_linker(engine: &Engine) -> Result<ComponentLinker<Runtim
 
     // Step 2: wasi:http/{outgoing-handler, types}. Components can make
     // outbound HTTP calls. Egress enforcement is wired via
-    // RuntimeState's WasiHttpView::send_request override.
+    // RuntimeState's `EgressHttpHooks` (stored as `http_hooks`), reached
+    // through `WasiHttpView::http()` -> `WasiHttpCtxView::hooks`.
     // Requires `RuntimeState: WasiHttpView` — implemented in runtime.rs.
     wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
 

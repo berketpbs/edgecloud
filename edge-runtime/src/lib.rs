@@ -1,9 +1,9 @@
 //! edge-runtime: WASI Preview 2 host interfaces for edge computing.
 
-// bindgen! requires literal `true`/`false` for `tracing`/`verbose_tracing`;
-// `cfg!(debug_assertions)` is not a literal at macro-expansion time. We pin
-// both to `false` for now (release-friendly). Re-enable later via a build
-// script or by emitting a config-time shim — neither is needed today.
+// wasmtime 45's bindgen! macro no longer accepts the top-level
+// `tracing` / `verbose_tracing` keys — they're replaced by per-function
+// `imports:` / `exports:` blocks. The old `false, false` defaults still
+// apply (no per-function tracing block here), so the silence is intentional.
 
 pub mod egress;
 pub mod engine;
@@ -55,7 +55,7 @@ pub mod interfaces;
 //     RuntimeState implements those Host traits in `runtime.rs`.
 //
 // We DO `with:` map `wasi:http/incoming-handler` (handler world only)
-// to `wasmtime_wasi_http::bindings::exports::wasi::http::incoming_handler`
+// to `wasmtime_wasi_http::p2::bindings::exports::wasi::http::incoming_handler`
 // — required so the handler world's EXPORT trait is the SAME
 // `Guest` trait wasmtime_wasi_http::ProxyPre calls into. Without this,
 // type-matched dispatch through `ProxyPre::call_handle` would fail
