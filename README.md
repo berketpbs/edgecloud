@@ -115,3 +115,9 @@ edgeCloud/
 ├── edge-test-helpers/      # standalone, NOT in workspace
 └── edge-worker/            # → edge-worker binary
 ```
+
+## License
+
+Proprietary — see [LICENSE](./LICENSE). All rights reserved.
+Unauthorized use is prohibited. Contact the copyright holder via
+[GitHub](https://github.com/poyrazK) to request a license.
