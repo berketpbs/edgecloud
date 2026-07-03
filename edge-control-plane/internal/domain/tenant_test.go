@@ -21,11 +21,11 @@ func TestTenant_JSONRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if !contains(data, `"Name":"acme-corp"`) {
-		t.Errorf("missing Name in JSON: %s", string(data))
+	if !contains(data, `"name":"acme-corp"`) {
+		t.Errorf("missing name in JSON: %s", string(data))
 	}
-	if !contains(data, `"Plan":"free"`) {
-		t.Errorf("missing Plan in JSON: %s", string(data))
+	if !contains(data, `"plan":"free"`) {
+		t.Errorf("missing plan in JSON: %s", string(data))
 	}
 	// AllowlistedDestinations should serialize as JSON array
 	if !contains(data, `["*.example.com","api.internal"]`) {
@@ -44,28 +44,7 @@ func TestTenant_JSONRoundTrip(t *testing.T) {
 }
 
 func TestDefaultQuota(t *testing.T) {
-	q := DefaultQuota("t_test")
-	if q.TenantID != "t_test" {
-		t.Errorf("TenantID = %q, want 't_test'", q.TenantID)
-	}
-	if q.MaxDeployments != 10 {
-		t.Errorf("MaxDeployments = %d, want 10", q.MaxDeployments)
-	}
-	if q.MaxApps != 5 {
-		t.Errorf("MaxApps = %d, want 5", q.MaxApps)
-	}
-	if q.MaxWorkers != 3 {
-		t.Errorf("MaxWorkers = %d, want 3", q.MaxWorkers)
-	}
-	if q.MaxMemoryMB != 256 {
-		t.Errorf("MaxMemoryMB = %d, want 256", q.MaxMemoryMB)
-	}
-	if q.MaxOutboundMB != 1000 {
-		t.Errorf("MaxOutboundMB = %d, want 1000", q.MaxOutboundMB)
-	}
-	if q.MaxRequestsPerMonth != 100_000 {
-		t.Errorf("MaxRequestsPerMonth = %d, want 100000", q.MaxRequestsPerMonth)
-	}
+	t.Skip("DefaultQuota was deleted in billing v0 review remediation; see plans.")
 }
 
 func TestTenantWithQuota_JSONRoundTrip(t *testing.T) {
@@ -92,8 +71,8 @@ func TestTenantWithQuota_JSONRoundTrip(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 	// Tenant fields should be flattened at top level
-	if !contains(data, `"Plan":"pro"`) {
-		t.Errorf("missing Plan in JSON: %s", string(data))
+	if !contains(data, `"plan":"pro"`) {
+		t.Errorf("missing plan in JSON: %s", string(data))
 	}
 	// Quota fields are emitted with snake_case keys (per the json tags
 	// added for billing v0). Verify one representative key plus the

@@ -7,10 +7,15 @@ import (
 )
 
 // Tenant represents a platform customer.
+//
+// JSON tags are snake_case to match the OpenAPI schema in
+// docs/api/openapi.yaml. Without json tags the response would emit
+// PascalCase keys ("Plan", "Name") which the schema does not declare.
+// The wire shape changed from PascalCase to snake_case in billing v0.
 type Tenant struct {
-	ID   string `db:"id"`
-	Name string `db:"name"`
-	Plan string `db:"plan"`
+	ID   string `db:"id"   json:"id"`
+	Name string `db:"name" json:"name"`
+	Plan string `db:"plan" json:"plan"`
 	// AllowlistedDestinations is a TEXT[] column. Typed as
 	// pq.StringArray (which is []string underneath) so the column
 	// scans correctly via lib/pq's Scanner — a bare []string does NOT
@@ -18,8 +23,8 @@ type Tenant struct {
 	// format is unchanged because pq.StringArray marshals identically
 	// to []string. The repo also wraps writes in pq.Array() for the
 	// same reason on the encoding side.
-	AllowlistedDestinations pq.StringArray `db:"allowlisted_destinations"`
-	CreatedAt               time.Time      `db:"created_at"`
+	AllowlistedDestinations pq.StringArray `db:"allowlisted_destinations" json:"allowlisted_destinations"`
+	CreatedAt               time.Time      `db:"created_at"               json:"created_at"`
 }
 
 // Quota defines resource limits for a tenant.
@@ -73,17 +78,6 @@ func (q Quota) UsagePct() *float64 {
 		return outPct
 	}
 	return reqPct
-}
-
-// DefaultQuota returns free-tier quota defaults. It is a thin wrapper around
-// QuotaForPlan("free"); new code should call QuotaForPlan(plan) directly so
-// the caller can handle ErrUnknownPlan.
-//
-// Deprecated: prefer QuotaForPlan(plan).
-func DefaultQuota(tenantID string) Quota {
-	q, _ := QuotaForPlan("free")
-	q.TenantID = tenantID
-	return q
 }
 
 // TenantWithQuota combines tenant and quota data.

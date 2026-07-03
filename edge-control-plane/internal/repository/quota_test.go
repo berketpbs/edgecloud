@@ -26,7 +26,11 @@ func TestQuotaRepository_Create(t *testing.T) {
 	repo, mock, cleanup := newQuotaMockRepo(t)
 	defer cleanup()
 
-	q := domain.DefaultQuota("t_1")
+	q, err := domain.QuotaForPlan("free")
+	if err != nil {
+		t.Fatalf("QuotaForPlan(free): %v", err)
+	}
+	q.TenantID = "t_1"
 
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO quotas`)).
 		WithArgs(q.TenantID, q.MaxDeployments, q.MaxApps, q.MaxWorkers, q.MaxMemoryMB, q.MaxOutboundMB, q.MaxRequestsPerMonth).
@@ -85,7 +89,11 @@ func TestQuotaRepository_Update(t *testing.T) {
 	repo, mock, cleanup := newQuotaMockRepo(t)
 	defer cleanup()
 
-	q := domain.DefaultQuota("t_1")
+	q, err := domain.QuotaForPlan("free")
+	if err != nil {
+		t.Fatalf("QuotaForPlan(free): %v", err)
+	}
+	q.TenantID = "t_1"
 	q.MaxDeployments = 50
 	q.MaxApps = 20
 
