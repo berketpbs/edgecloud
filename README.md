@@ -115,7 +115,3 @@ edgeCloud/
 ├── edge-test-helpers/      # standalone, NOT in workspace
 └── edge-worker/            # → edge-worker binary
 ```
-
-## License
-
-`MIT OR Apache-2.0` — declared in [Cargo.toml](./Cargo.toml) `[workspace.package]`.
