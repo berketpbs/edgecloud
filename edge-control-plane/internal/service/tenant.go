@@ -74,6 +74,7 @@ type TenantServiceInterface interface {
 	GetQuota(ctx context.Context, tenantID string) (*domain.Quota, error)
 	ListTenants(ctx context.Context) ([]domain.Tenant, error)
 	UpdateTenant(ctx context.Context, t *domain.Tenant) error
+	UpdateTenantPlan(ctx context.Context, tenantID, newPlan string, applyQuotaDefaults bool) error
 	DeleteTenant(ctx context.Context, id string) error
 }
 
@@ -90,6 +91,8 @@ func NewTenantService(db *sqlx.DB, tenantRepo *repository.TenantRepository, quot
 }
 
 // CreateTenant creates a new tenant with default quota atomically.
+// The plan argument must be a known plan name (see domain.IsValidPlan); an
+// unknown plan returns domain.ErrUnknownPlan wrapped.
 func (s *TenantService) CreateTenant(ctx context.Context, name, plan string) (*domain.Tenant, error) {
 	tenant := &domain.Tenant{
 		ID:                      "t_" + uuid.New().String(),
@@ -107,7 +110,11 @@ func (s *TenantService) CreateTenant(ctx context.Context, name, plan string) (*d
 			return fmt.Errorf("creating tenant: %w", err)
 		}
 
-		quota := domain.DefaultQuota(tenant.ID)
+		quota, err := domain.QuotaForPlan(plan)
+		if err != nil {
+			return err
+		}
+		quota.TenantID = tenant.ID
 		if err := quotaRepo.Create(ctx, &quota); err != nil {
 			return fmt.Errorf("creating quota: %w", err)
 		}
@@ -151,7 +158,11 @@ func (s *TenantService) BootstrapTenant(ctx context.Context, name, plan, keyName
 			return fmt.Errorf("creating tenant: %w", err)
 		}
 
-		quota := domain.DefaultQuota(tenant.ID)
+		quota, err := domain.QuotaForPlan(plan)
+		if err != nil {
+			return err
+		}
+		quota.TenantID = tenant.ID
 		if err := quotaRepo.Create(ctx, &quota); err != nil {
 			return fmt.Errorf("creating quota: %w", err)
 		}
@@ -202,6 +213,58 @@ func (s *TenantService) ListTenants(ctx context.Context) ([]domain.Tenant, error
 
 func (s *TenantService) UpdateTenant(ctx context.Context, t *domain.Tenant) error {
 	return s.tenantRepo.Update(ctx, t)
+}
+
+// UpdateTenantPlan changes a tenant's plan and, by default, reapplies the
+// per-tier quota defaults so the new plan's ceilings take effect immediately.
+//
+// When applyQuotaDefaults is true, every Max* column on the quotas row is
+// overwritten with domain.QuotaForPlan(newPlan). The used_outbound_bytes,
+// used_request_count, and quota_period_start columns are NOT touched —
+// existing usage in the current billing period carries over to the new plan.
+//
+// When applyQuotaDefaults is false, only tenants.plan is updated; the quotas
+// row is left untouched (useful when an admin has hand-tuned per-tenant limits
+// and only wants to flip the plan label).
+//
+// Returns domain.ErrUnknownPlan when newPlan is not a known tier.
+func (s *TenantService) UpdateTenantPlan(ctx context.Context, tenantID, newPlan string, applyQuotaDefaults bool) error {
+	if !domain.IsValidPlan(newPlan) {
+		return fmt.Errorf("%w: %q", domain.ErrUnknownPlan, newPlan)
+	}
+
+	tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
+	if err != nil {
+		return fmt.Errorf("getting tenant: %w", err)
+	}
+	if tenant == nil {
+		return fmt.Errorf("tenant not found")
+	}
+	tenant.Plan = newPlan
+	if err := s.tenantRepo.Update(ctx, tenant); err != nil {
+		return fmt.Errorf("updating tenant: %w", err)
+	}
+
+	if !applyQuotaDefaults {
+		return nil
+	}
+
+	quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
+	if err != nil {
+		return fmt.Errorf("getting quota: %w", err)
+	}
+	if quota == nil {
+		return fmt.Errorf("quota not found for tenant")
+	}
+	newDefaults, err := domain.QuotaForPlan(newPlan)
+	if err != nil {
+		return err
+	}
+	newDefaults.TenantID = tenantID
+	if err := s.quotaRepo.Update(ctx, &newDefaults); err != nil {
+		return fmt.Errorf("updating quota: %w", err)
+	}
+	return nil
 }
 
 func (s *TenantService) DeleteTenant(ctx context.Context, id string) error {

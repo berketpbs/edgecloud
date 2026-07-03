@@ -63,6 +63,9 @@ func TestDefaultQuota(t *testing.T) {
 	if q.MaxOutboundMB != 1000 {
 		t.Errorf("MaxOutboundMB = %d, want 1000", q.MaxOutboundMB)
 	}
+	if q.MaxRequestsPerMonth != 100_000 {
+		t.Errorf("MaxRequestsPerMonth = %d, want 100000", q.MaxRequestsPerMonth)
+	}
 }
 
 func TestTenantWithQuota_JSONRoundTrip(t *testing.T) {
@@ -75,12 +78,13 @@ func TestTenantWithQuota_JSONRoundTrip(t *testing.T) {
 			CreatedAt: now,
 		},
 		Quota: Quota{
-			TenantID:       "t_xyz",
-			MaxDeployments: 50,
-			MaxApps:        20,
-			MaxWorkers:     10,
-			MaxMemoryMB:    1024,
-			MaxOutboundMB:  10000,
+			TenantID:            "t_xyz",
+			MaxDeployments:      50,
+			MaxApps:             20,
+			MaxWorkers:          10,
+			MaxMemoryMB:         1024,
+			MaxOutboundMB:       10000,
+			MaxRequestsPerMonth: 5_000_000,
 		},
 	}
 	data, err := json.Marshal(tq)
@@ -91,7 +95,13 @@ func TestTenantWithQuota_JSONRoundTrip(t *testing.T) {
 	if !contains(data, `"Plan":"pro"`) {
 		t.Errorf("missing Plan in JSON: %s", string(data))
 	}
-	if !contains(data, `"MaxApps":20`) {
-		t.Errorf("missing MaxApps in JSON: %s", string(data))
+	// Quota fields are emitted with snake_case keys (per the json tags
+	// added for billing v0). Verify one representative key plus the
+	// new max_requests_per_month field.
+	if !contains(data, `"max_apps":20`) {
+		t.Errorf("missing max_apps in JSON: %s", string(data))
+	}
+	if !contains(data, `"max_requests_per_month":5000000`) {
+		t.Errorf("missing max_requests_per_month in JSON: %s", string(data))
 	}
 }

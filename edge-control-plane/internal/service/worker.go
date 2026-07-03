@@ -39,6 +39,7 @@ type workerRepoInterface interface {
 type quotaRepoInterface interface {
 	GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error)
 	AddOutboundBytes(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
+	AddRequestCount(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
 }
 
 // activeRepoInterface defines the active_deployments methods used by
@@ -260,6 +261,11 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *nats.Msg) {
 	// shutting down. Context values (trace IDs, etc.) are preserved.
 	go s.checkOutboundQuota(context.WithoutCancel(ctx), hb.Apps)
 
+	// Same goroutine pattern as checkOutboundQuota above. This is a second
+	// DB round-trip per heartbeat — Phase 2 ticket could batch both writes
+	// into one UPDATE.
+	go s.checkRequestCount(context.WithoutCancel(ctx), hb.Apps)
+
 	// Ingest observer metrics into the in-memory aggregator so they are
 	// immediately available at the Prometheus scrape endpoints. Pure
 	// in-memory — no DB round-trip, so we do it inline (cheap).
@@ -337,6 +343,58 @@ func (s *WorkerService) checkOutboundQuota(ctx context.Context, appsRaw json.Raw
 			log.Printf(
 				"quota: tenant %s used %d outbound bytes, exceeds monthly limit %d (%d MB) — enforcement pending",
 				tenantID, quota.UsedOutboundBytes, limitBytes, quota.MaxOutboundMB,
+			)
+		}
+	}
+}
+
+// checkRequestCount accumulates request_count from this heartbeat into the
+// tenant's running total in the DB (cross-worker, cross-interval), then logs
+// a violation when the cumulative total exceeds the per-month
+// max_requests_per_month cap. Mirrors checkOutboundQuota but reads
+// app.RequestCount instead of app.OutboundBytes. Phase 1: log-only.
+//
+// Sentinel: MaxRequestsPerMonth < 0 means "unlimited" (the enterprise tier
+// stores -1 for all max_* columns). MaxRequestsPerMonth == 0 means "unset /
+// admin-cleared" — same handling as outbound: skip the breach check rather
+// than false-trip a tenant whose cap hasn't been initialized.
+func (s *WorkerService) checkRequestCount(ctx context.Context, appsRaw json.RawMessage) {
+	if len(appsRaw) == 0 {
+		return
+	}
+	var apps map[string]domain.AppStatus
+	if err := json.Unmarshal(appsRaw, &apps); err != nil {
+		log.Printf("heartbeat: could not decode apps for request-count check: %v", err)
+		return
+	}
+
+	byTenant := make(map[string]uint64)
+	for _, app := range apps {
+		if app.TenantID != "" {
+			byTenant[app.TenantID] += app.RequestCount
+		}
+	}
+
+	for tenantID, deltaReq := range byTenant {
+		if deltaReq == 0 {
+			continue
+		}
+		quota, err := s.quotaRepo.AddRequestCount(ctx, tenantID, deltaReq)
+		if err != nil {
+			log.Printf("heartbeat: failed to record request count for tenant %s: %v", tenantID, err)
+			continue
+		}
+		if quota == nil {
+			continue
+		}
+		if quota.MaxRequestsPerMonth <= 0 {
+			// Unlimited (sentinel -1) or unconfigured (0) — nothing to enforce.
+			continue
+		}
+		if quota.UsedRequestCount > int64(quota.MaxRequestsPerMonth) {
+			log.Printf(
+				"quota: tenant %s used %d requests, exceeds monthly limit %d — enforcement pending",
+				tenantID, quota.UsedRequestCount, quota.MaxRequestsPerMonth,
 			)
 		}
 	}

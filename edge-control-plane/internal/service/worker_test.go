@@ -72,6 +72,7 @@ func (m *mockWorkerRepo) GetByID(ctx context.Context, id string) (*domain.Worker
 type mockQuotaRepo struct {
 	getByTenantIDFunc    func(ctx context.Context, tenantID string) (*domain.Quota, error)
 	addOutboundBytesFunc func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
+	addRequestCountFunc  func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
 }
 
 func (m *mockQuotaRepo) GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error) {
@@ -84,6 +85,13 @@ func (m *mockQuotaRepo) GetByTenantID(ctx context.Context, tenantID string) (*do
 func (m *mockQuotaRepo) AddOutboundBytes(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error) {
 	if m.addOutboundBytesFunc != nil {
 		return m.addOutboundBytesFunc(ctx, tenantID, delta)
+	}
+	return &domain.Quota{}, nil
+}
+
+func (m *mockQuotaRepo) AddRequestCount(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error) {
+	if m.addRequestCountFunc != nil {
+		return m.addRequestCountFunc(ctx, tenantID, delta)
 	}
 	return &domain.Quota{}, nil
 }

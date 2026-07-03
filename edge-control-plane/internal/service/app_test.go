@@ -96,6 +96,10 @@ func (m *mockQuotaRepoForApps) AddOutboundBytes(_ context.Context, _ string, _ u
 	return &domain.Quota{}, nil
 }
 
+func (m *mockQuotaRepoForApps) AddRequestCount(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+	return &domain.Quota{}, nil
+}
+
 // appSvcForTest builds an AppService with mock dependencies.
 // Only use for testing methods that don't invoke cascade delete (Create, Get, List, CreateIfNotExists).
 // Delete is not testable without a real DB connection for repository.Transaction.

@@ -23,14 +23,14 @@ func (r *QuotaRepository) WithTx(tx *sqlx.Tx) *QuotaRepository {
 }
 
 func (r *QuotaRepository) Create(ctx context.Context, q *domain.Quota) error {
-	query := `INSERT INTO quotas (tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb) VALUES ($1, $2, $3, $4, $5, $6)`
-	_, err := r.db.ExecContext(ctx, query, q.TenantID, q.MaxDeployments, q.MaxApps, q.MaxWorkers, q.MaxMemoryMB, q.MaxOutboundMB)
+	query := `INSERT INTO quotas (tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month) VALUES ($1, $2, $3, $4, $5, $6, $7)`
+	_, err := r.db.ExecContext(ctx, query, q.TenantID, q.MaxDeployments, q.MaxApps, q.MaxWorkers, q.MaxMemoryMB, q.MaxOutboundMB, q.MaxRequestsPerMonth)
 	return err
 }
 
 func (r *QuotaRepository) GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error) {
 	var q domain.Quota
-	query := `SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, used_outbound_bytes, quota_period_start FROM quotas WHERE tenant_id = $1`
+	query := `SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, quota_period_start FROM quotas WHERE tenant_id = $1`
 	err := r.db.GetContext(ctx, &q, query, tenantID)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -59,7 +59,37 @@ func (r *QuotaRepository) AddOutboundBytes(ctx context.Context, tenantID string,
 				ELSE quota_period_start
 			END
 		WHERE tenant_id = $1
-		RETURNING tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, used_outbound_bytes, quota_period_start`
+		RETURNING tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, quota_period_start`
+	err := r.db.GetContext(ctx, &q, query, tenantID, int64(delta))
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &q, err
+}
+
+// AddRequestCount atomically accumulates delta into used_request_count and
+// returns the updated quota row. Mirrors AddOutboundBytes: a lazy month
+// rollover against quota_period_start resets the counter when the stored
+// period is in a past calendar month (UTC). Used by
+// service.WorkerService.checkRequestCount on every heartbeat.
+func (r *QuotaRepository) AddRequestCount(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error) {
+	var q domain.Quota
+	query := `
+		UPDATE quotas SET
+			used_request_count = CASE
+				WHEN date_trunc('month', quota_period_start AT TIME ZONE 'UTC')
+				     < date_trunc('month', now() AT TIME ZONE 'UTC')
+				THEN $2
+				ELSE used_request_count + $2
+			END,
+			quota_period_start = CASE
+				WHEN date_trunc('month', quota_period_start AT TIME ZONE 'UTC')
+				     < date_trunc('month', now() AT TIME ZONE 'UTC')
+				THEN date_trunc('month', now() AT TIME ZONE 'UTC')
+				ELSE quota_period_start
+			END
+		WHERE tenant_id = $1
+		RETURNING tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, quota_period_start`
 	err := r.db.GetContext(ctx, &q, query, tenantID, int64(delta))
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -68,7 +98,7 @@ func (r *QuotaRepository) AddOutboundBytes(ctx context.Context, tenantID string,
 }
 
 func (r *QuotaRepository) Update(ctx context.Context, q *domain.Quota) error {
-	query := `UPDATE quotas SET max_deployments = $2, max_apps = $3, max_workers = $4, max_memory_mb = $5, max_outbound_mb = $6 WHERE tenant_id = $1`
-	_, err := r.db.ExecContext(ctx, query, q.TenantID, q.MaxDeployments, q.MaxApps, q.MaxWorkers, q.MaxMemoryMB, q.MaxOutboundMB)
+	query := `UPDATE quotas SET max_deployments = $2, max_apps = $3, max_workers = $4, max_memory_mb = $5, max_outbound_mb = $6, max_requests_per_month = $7 WHERE tenant_id = $1`
+	_, err := r.db.ExecContext(ctx, query, q.TenantID, q.MaxDeployments, q.MaxApps, q.MaxWorkers, q.MaxMemoryMB, q.MaxOutboundMB, q.MaxRequestsPerMonth)
 	return err
 }
