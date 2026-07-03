@@ -46,9 +46,9 @@ use crate::edge_runtime_long::edge::cloud::{
     time::Host as LongTimeHost,
 };
 use crate::egress::EgressPolicy;
-use crate::store::HasStoreLimits;
 use crate::interfaces::{cache, kv_store, observe, process, scheduling, time};
 use crate::metering::RequestMeter;
+use crate::store::HasStoreLimits;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::Path;
