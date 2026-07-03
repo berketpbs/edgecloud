@@ -54,13 +54,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use wasmtime::component::ResourceTable;
-use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiView};
-use wasmtime_wasi_http::bindings::http::types::ErrorCode;
-use wasmtime_wasi_http::body::HyperOutgoingBody;
-use wasmtime_wasi_http::types::{
-    default_send_request, HostFutureIncomingResponse, OutgoingRequestConfig,
+use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
+use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
+use wasmtime_wasi_http::p2::types::{HostFutureIncomingResponse, OutgoingRequestConfig};
+use wasmtime_wasi_http::p2::{
+    default_send_request, HttpError, HttpResult, WasiHttpCtxView, WasiHttpHooks, WasiHttpView,
 };
-use wasmtime_wasi_http::{HttpError, HttpResult, WasiHttpCtx, WasiHttpView};
+use wasmtime_wasi_http::WasiHttpCtx;
 
 /// Process-wide per-tenant store registries. Each tenant gets its own
 /// `Arc<KvStore>` / `Arc<Cache>` / `Scheduler`, cached here so state is
@@ -105,6 +106,15 @@ pub struct RuntimeState {
     /// `wasi:http/outgoing-handler` host impl (deferred to the linker task).
     pub egress: Arc<EgressPolicy>,
 
+    /// wasmtime 45 moved `send_request` off the `WasiHttpView` trait and
+    /// onto a new `WasiHttpHooks` trait, referenced by
+    /// `WasiHttpCtxView::hooks`. We store the concrete `EgressHttpHooks`
+    /// struct here; `WasiHttpView::http()` coerces `&mut self.http_hooks`
+    /// to `&mut dyn WasiHttpHooks` for the linker. Concrete storage
+    /// avoids the per-request `Box::new` + `String::clone` that a boxed
+    /// trait object would force.
+    pub(crate) http_hooks: EgressHttpHooks,
+
     /// Shared exit-code flag set by `Process::exit` when the guest calls
     /// `process.exit`. Allows `execute_app` to distinguish a clean guest
     /// exit from a wasm trap.
@@ -139,6 +149,7 @@ impl RuntimeState {
             wasi_env_for_clone: env,
             tenant_id: String::new(),
             egress: Arc::new(EgressPolicy::allow_all()),
+            http_hooks: EgressHttpHooks::new(Arc::new(EgressPolicy::allow_all()), String::new()),
             exit_code,
         }
     }
@@ -195,8 +206,12 @@ impl RuntimeState {
             wasi_http_ctx: WasiHttpCtx::new(),
             resource_table: ResourceTable::new(),
             wasi_env_for_clone: env,
-            tenant_id,
-            egress,
+            tenant_id: tenant_id.clone(),
+            egress: egress.clone(),
+            // The hooks box shares the same Arc-shared EgressPolicy and
+            // tenant id as the top-level fields, so a future mid-flight
+            // policy swap (returning a new Arc) only updates one place.
+            http_hooks: EgressHttpHooks::new(egress, tenant_id),
             exit_code,
         }
     }
@@ -249,6 +264,7 @@ impl Clone for RuntimeState {
             wasi_env_for_clone: self.wasi_env_for_clone.clone(),
             tenant_id: self.tenant_id.clone(),
             egress: self.egress.clone(),
+            http_hooks: EgressHttpHooks::new(self.egress.clone(), self.tenant_id.clone()),
             exit_code: Arc::new(AtomicU32::new(0)),
         }
     }
@@ -261,35 +277,45 @@ impl Clone for RuntimeState {
 /// wasmtime 25 split this into two separate methods (no `WasiCtxView`
 /// tuple type).
 impl WasiView for RuntimeState {
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.wasi_ctx
-    }
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.resource_table
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi_ctx,
+            table: &mut self.resource_table,
+        }
     }
 }
 
-/// `WasiHttpView` — required by `wasmtime_wasi_http::add_only_http_to_linker_async`.
-/// The default `send_request` is overridden to enforce the tenant's
-/// `EgressPolicy` (Phase C-3). Per-request outbound requests go through
-/// this path: `guest.wasi:http/outgoing-handler::handle(req, out)` →
-/// `WasiHttpImpl<&mut T>::send_request` → `T::send_request` →
-/// `EgressPolicy::check(url)` → either denied (returns `Err`) or
-/// forwarded to the canonical `default_send_request` impl.
+/// Per-tenant `WasiHttpHooks` impl. wasmtime 45 split the outgoing-HTTP
+/// customization off the `WasiHttpView` trait into a separate
+/// `WasiHttpHooks` trait, referenced from `WasiHttpCtxView::hooks`.
+/// `send_request` is the only hook we override — it enforces the tenant's
+/// `EgressPolicy` before opening any TCP connection.
+///
+/// Per-request outbound requests go through this path:
+/// `guest.wasi:http/outgoing-handler::handle(req, out)` →
+/// `WasiHttpImpl<&mut T>::send_request` → `T::http().hooks.send_request`
+/// (where `T::http()` returns the `WasiHttpCtxView` and `hooks` is our
+/// `&mut EgressHttpHooks`) → `EgressPolicy::check(url)` → either
+/// denied (returns `Err`) or forwarded to the canonical
+/// `default_send_request` impl.
 ///
 /// The check runs PRE-DNS, so a denied host NEVER leaves the worker.
-/// The DNS-rebinding guard (`EgressPolicy::check_resolved_ip`) is best-
-/// effort in v0.2 — `wasmtime-wasi-http` 25.0.3 doesn't expose the
-/// hyper `connect_hook` we'd need to actually inspect the resolved IP
-/// before connect. v0.3 will land this via a hyper upgrade. See the
-/// `egress` field and the plan §C-3 "DNS-rebinding guard" decision.
-impl WasiHttpView for RuntimeState {
-    fn ctx(&mut self) -> &mut WasiHttpCtx {
-        &mut self.wasi_http_ctx
+/// The DNS-rebinding guard (`EgressPolicy::check_resolved_ip`) is
+/// best-effort in v0.2 — wasmtime-wasi-http 45 has no `connect_hook`
+/// for IP-level enforcement. See the `egress` field and plan §C-3
+/// "DNS-rebinding guard" decision.
+pub(crate) struct EgressHttpHooks {
+    pub(crate) egress: Arc<EgressPolicy>,
+    pub(crate) tenant_id: String,
+}
+
+impl EgressHttpHooks {
+    pub(crate) fn new(egress: Arc<EgressPolicy>, tenant_id: String) -> Self {
+        Self { egress, tenant_id }
     }
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.resource_table
-    }
+}
+
+impl WasiHttpHooks for EgressHttpHooks {
     fn send_request(
         &mut self,
         request: hyper::Request<HyperOutgoingBody>,
@@ -315,14 +341,33 @@ impl WasiHttpView for RuntimeState {
         // send_request implementation that wasmtime-wasi-http ships.
         Ok(default_send_request(request, config))
     }
-    // `is_forbidden_header` falls back to the WasiHttpView default which
-    // strips the canonical hop-by-hop / connection-state header set
-    // (Connection, Keep-Alive, Proxy-Authenticate, Proxy-Authorization,
-    // TE, Trailers, Transfer-Encoding, Upgrade, Host, Http2-Settings).
-    // Adding egress-specific stripping here would require new
-    // EgressPolicy methods that we don't need for v0.2 — every header a
-    // tenant wants blocked is already enforced by the URL-level
-    // `EgressPolicy::check` above.
+    // `is_forbidden_header` falls back to the `WasiHttpHooks` default
+    // which strips the canonical hop-by-hop / connection-state header
+    // set (Connection, Keep-Alive, Proxy-Authenticate,
+    // Proxy-Authorization, TE, Trailers, Transfer-Encoding, Upgrade,
+    // Host, Http2-Settings). Adding egress-specific stripping here
+    // would require new `EgressPolicy` methods we don't need for v0.2 —
+    // every header a tenant wants blocked is already enforced by the
+    // URL-level `EgressPolicy::check` above.
+}
+
+/// `WasiHttpView` — required by `wasmtime_wasi_http::p2::add_only_http_to_linker_async`.
+/// wasmtime 45 collapsed the trait from `{ctx, table}` into a single
+/// `http()` method returning a `WasiHttpCtxView` bundle (mirrors the
+/// `WasiView` change in wasmtime 36). The `hooks` field is the
+/// `EgressHttpHooks` box stored on `RuntimeState`.
+impl WasiHttpView for RuntimeState {
+    fn http(&mut self) -> WasiHttpCtxView<'_> {
+        // `&mut self.http_hooks` (a `&mut EgressHttpHooks`) coerces to
+        // `&mut dyn WasiHttpHooks` at the struct-literal site via the
+        // `WasiHttpHooks for EgressHttpHooks` impl above. No Box, no
+        // heap indirection.
+        WasiHttpCtxView {
+            ctx: &mut self.wasi_http_ctx,
+            table: &mut self.resource_table,
+            hooks: &mut self.http_hooks,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -345,7 +390,18 @@ mod send_request_tests {
     use hyper::Request;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
-    use wasmtime_wasi_http::WasiHttpView;
+
+    /// Default request config used by every `send_request` test below.
+    /// Hoisted out of the test bodies so a future field addition to
+    /// `OutgoingRequestConfig` only updates one site (and so the
+    /// tests don't drift to inconsistent defaults).
+    const TEST_REQUEST_CONFIG: wasmtime_wasi_http::p2::types::OutgoingRequestConfig =
+        wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
+            use_tls: false,
+            connect_timeout: std::time::Duration::from_secs(60),
+            first_byte_timeout: std::time::Duration::from_secs(60),
+            between_bytes_timeout: std::time::Duration::from_secs(60),
+        };
 
     /// A no-op `LogSink` for tests that only exercise `send_request`.
     struct NoopSink;
@@ -372,11 +428,11 @@ mod send_request_tests {
     /// Build a minimal `hyper::Request<HyperOutgoingBody>` with the
     /// supplied URL. The body is empty — we never get past the URL
     /// check so no real network IO happens.
-    fn make_request(uri: &str) -> Request<wasmtime_wasi_http::body::HyperOutgoingBody> {
+    fn make_request(uri: &str) -> Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody> {
         Request::builder()
             .uri(uri)
             .method("GET")
-            .body(wasmtime_wasi_http::body::HyperOutgoingBody::default())
+            .body(wasmtime_wasi_http::p2::body::HyperOutgoingBody::default())
             .expect("test request build")
     }
 
@@ -390,13 +446,7 @@ mod send_request_tests {
             "api.stripe.com".to_string()
         ])));
         let req = make_request("http://127.0.0.1/");
-        let config = wasmtime_wasi_http::types::OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: std::time::Duration::from_secs(60),
-            first_byte_timeout: std::time::Duration::from_secs(60),
-            between_bytes_timeout: std::time::Duration::from_secs(60),
-        };
-        let result = state.send_request(req, config);
+        let result = state.http().hooks.send_request(req, TEST_REQUEST_CONFIG);
         assert!(result.is_err(), "expected Err for denied host, got Ok");
         let msg = format!("{:?}", result.unwrap_err()).to_lowercase();
         assert!(
@@ -417,13 +467,7 @@ mod send_request_tests {
             "api.stripe.com".to_string()
         ])));
         let req = make_request("https://api.stripe.com/v1/charges");
-        let config = wasmtime_wasi_http::types::OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: std::time::Duration::from_secs(60),
-            first_byte_timeout: std::time::Duration::from_secs(60),
-            between_bytes_timeout: std::time::Duration::from_secs(60),
-        };
-        let result = state.send_request(req, config);
+        let result = state.http().hooks.send_request(req, TEST_REQUEST_CONFIG);
         assert!(
             result.is_ok(),
             "expected Ok from send_request for allowlisted host, got: {:?}",
@@ -437,13 +481,7 @@ mod send_request_tests {
         // must be denied.
         let mut state = state_with_egress(Arc::new(EgressPolicy::new(vec![])));
         let req = make_request("https://example.com/");
-        let config = wasmtime_wasi_http::types::OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: std::time::Duration::from_secs(60),
-            first_byte_timeout: std::time::Duration::from_secs(60),
-            between_bytes_timeout: std::time::Duration::from_secs(60),
-        };
-        let result = state.send_request(req, config);
+        let result = state.http().hooks.send_request(req, TEST_REQUEST_CONFIG);
         assert!(result.is_err(), "expected Err for empty allowlist, got Ok");
     }
 
@@ -453,13 +491,7 @@ mod send_request_tests {
         // pass, only hard-denied IPs would still error.
         let mut state = state_with_egress(Arc::new(EgressPolicy::allow_all()));
         let req = make_request("http://127.0.0.1/");
-        let config = wasmtime_wasi_http::types::OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: std::time::Duration::from_secs(60),
-            first_byte_timeout: std::time::Duration::from_secs(60),
-            between_bytes_timeout: std::time::Duration::from_secs(60),
-        };
-        let result = state.send_request(req, config);
+        let result = state.http().hooks.send_request(req, TEST_REQUEST_CONFIG);
         // Loopback still hard-denied even under allow_all() — this
         // confirms the hard-deny layer precedes the allowlist.
         assert!(
@@ -476,13 +508,7 @@ mod send_request_tests {
                 vec!["*.stripe.com".to_string()],
             )));
         let req = make_request("https://api.stripe.com/v1/charges");
-        let config = wasmtime_wasi_http::types::OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: std::time::Duration::from_secs(60),
-            first_byte_timeout: std::time::Duration::from_secs(60),
-            between_bytes_timeout: std::time::Duration::from_secs(60),
-        };
-        let result = state.send_request(req, config);
+        let result = state.http().hooks.send_request(req, TEST_REQUEST_CONFIG);
         assert!(
             result.is_ok(),
             "expected Ok for wildcard-matched host, got: {:?}",
