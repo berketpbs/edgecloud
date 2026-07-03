@@ -214,6 +214,13 @@ enum Command {
     /// Show tenant quota and usage.
     Quota,
 
+    /// Show the ingress target (worker address and port) for a running app.
+    Ingress {
+        /// App name. Defaults to the app in `.edge/state.json`.
+        #[arg(default_value = "")]
+        app: String,
+    },
+
     /// Read recent log entries for the app (issue #77).
     ///
     /// Calls `GET /api/v1/apps/{appName}/logs` and prints the most
@@ -347,6 +354,7 @@ fn main() -> Result<()> {
         Command::Open { force } => commands::open::run(&cli.path, force),
         Command::Deployments => commands::deployments::run(&cli.path),
         Command::Quota => commands::quota::run(&cli.path),
+        Command::Ingress { app } => commands::ingress::run(&cli.path, &app),
         Command::Logs {
             app,
             since,

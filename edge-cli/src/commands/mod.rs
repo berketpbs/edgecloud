@@ -10,6 +10,7 @@ pub mod dev;
 pub mod domains;
 pub mod egress;
 pub mod env;
+pub mod ingress;
 pub mod init;
 pub mod logs;
 pub mod migrate;
