@@ -119,5 +119,5 @@ edgeCloud/
 ## License
 
 Proprietary — see [LICENSE](./LICENSE). All rights reserved.
-Unauthorized use is prohibited. Contact the copyright holder via
-[GitHub](https://github.com/poyrazK) to request a license.
+Unauthorized use is prohibited. Contact the copyright holder at
+`hpk.poyraz@gmail.com` to request a license.
