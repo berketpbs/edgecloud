@@ -365,6 +365,21 @@ pub struct EgressAllowlist {
     pub allowlist: Vec<String>,
 }
 
+/// Ingress target for a running app, returned by
+/// `GET /api/v1/apps/{appName}/ingress`. The `ready` field indicates
+/// whether the app is currently running on a worker. When `false`,
+/// only `app_name` is populated (plus `reason` in the raw response).
+#[derive(Debug, Deserialize)]
+pub struct IngressResponse {
+    pub ready: bool,
+    pub app_name: String,
+    pub tenant_id: Option<String>,
+    pub worker_id: Option<String>,
+    pub region: Option<String>,
+    pub worker_addr: Option<String>,
+    pub port: Option<i32>,
+}
+
 impl ApiClient {
     /// Create a new API client. Loads the API key from
     /// `EDGE_API_KEY` env var or `~/.config/edgecloud/config.toml`.
@@ -821,6 +836,14 @@ impl ApiClient {
         })?;
         // Server returns the stored allowlist; re-fetch to surface it.
         self.get_egress()
+    }
+
+    /// GET `/api/v1/apps/{appName}/ingress` — get the ingress target
+    /// (worker address and port) for a running app.
+    pub fn get_ingress(&self, app_name: &str) -> Result<IngressResponse> {
+        self.get_json_anyhow("get ingress", |base| {
+            format!("{base}/api/v1/apps/{app_name}/ingress")
+        })
     }
 
     // ---- Custom-domain (issue #83) ----
