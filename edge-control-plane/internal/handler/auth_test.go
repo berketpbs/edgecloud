@@ -42,6 +42,9 @@ func (m *mockAuthTenantSvc) ListTenants(ctx context.Context) ([]domain.Tenant, e
 func (m *mockAuthTenantSvc) UpdateTenant(ctx context.Context, t *domain.Tenant) error {
 	panic("not used by Whoami")
 }
+func (m *mockAuthTenantSvc) UpdateTenantPlan(ctx context.Context, tenantID, newPlan string, applyQuotaDefaults bool) error {
+	panic("not used by Whoami")
+}
 func (m *mockAuthTenantSvc) DeleteTenant(ctx context.Context, id string) error {
 	panic("not used by Whoami")
 }

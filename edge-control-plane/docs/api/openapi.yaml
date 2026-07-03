@@ -550,8 +550,38 @@ components:
           example: 256
         max_outbound_mb:
           type: integer
-          description: Outbound egress cap in MB per month.
+          description: Outbound egress cap in MB per month. -1 = unlimited (enterprise).
           example: 1000
+        max_requests_per_month:
+          type: integer
+          description: |
+            Request-count cap per calendar month (UTC). -1 = unlimited (enterprise).
+            Default value depends on the tenant's plan:
+            free=100000, pro=5000000, business=50000000, enterprise=unlimited.
+          example: 5000000
+        used_outbound_bytes:
+          type: integer
+          format: int64
+          description: Cumulative outbound bytes used in the current UTC month. Resets on month rollover.
+          example: 0
+        used_request_count:
+          type: integer
+          format: int64
+          description: Cumulative request count in the current UTC month. Resets on month rollover.
+          example: 0
+        quota_period_start:
+          type: string
+          format: date-time
+          description: UTC timestamp at which the current usage period began. Used as the month-rollover boundary.
+          example: 2026-07-01T00:00:00Z
+        usage_pct:
+          type: number
+          nullable: true
+          description: |
+            Highest usage percentage across the two monthly caps
+            (outbound_bytes / max_outbound_mb and request_count / max_requests_per_month),
+            expressed as a 0-100 value. null when both caps are unlimited.
+          example: 42.5
 
     # -------------------------------------------------------------------------
     # Migration
