@@ -30,22 +30,3 @@ func auditRecord(r *http.Request, action, resource, resourceID, details, outcome
 		RequestIP:  service.StripPort(r.RemoteAddr),
 	})
 }
-
-// auditRecordError records a failed action.
-func auditRecordError(r *http.Request, action, resource, resourceID, details, errMsg string) {
-	if DefaultAuditor == nil {
-		return
-	}
-	DefaultAuditor.Record(service.AuditInfo{
-		TenantID:   middleware.GetTenantID(r.Context()),
-		APIKeyID:   middleware.GetAPIKeyID(r.Context()),
-		Role:       middleware.GetRole(r.Context()),
-		Action:     action,
-		Resource:   resource,
-		ResourceID: resourceID,
-		Details:    details,
-		Outcome:    "failure",
-		ErrorMsg:   errMsg,
-		RequestIP:  service.StripPort(r.RemoteAddr),
-	})
-}
