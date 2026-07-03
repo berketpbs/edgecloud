@@ -114,6 +114,11 @@ func New(
 		reconcileSvc.SetEnvDecrypter(secretsEnc)
 	}
 
+	webhookRepo := repository.NewWebhookRepository(db)
+	webhookSvc := service.NewWebhookService(webhookRepo)
+	deploymentSvc.SetWebhookService(webhookSvc)
+	webhookHandler := handler.NewWebhookHandler(webhookSvc)
+
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
 	logSvc := service.NewLogService(logEntryRepo)
 	domainSvc := service.NewDomainService(db, domainRepo, appRepo)
@@ -326,6 +331,12 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("GET /api/v1/apps/{appName}/domains", domainHandler.List)
 	api.HandleFunc("GET /api/v1/apps/{appName}/domains/{fqdn}", domainHandler.Get)
 	api.HandleFunc("DELETE /api/v1/apps/{appName}/domains/{fqdn}", domainHandler.Remove)
+
+	// Webhook CRUD routes
+	api.HandleFunc("POST /api/v1/webhooks", webhookHandler.Create)
+	api.HandleFunc("GET /api/v1/webhooks", webhookHandler.List)
+	api.HandleFunc("PUT /api/v1/webhooks/{webhookID}", webhookHandler.Update)
+	api.HandleFunc("DELETE /api/v1/webhooks/{webhookID}", webhookHandler.Delete)
 
 	// Admin routes (require owner role)
 	admin := http.NewServeMux()

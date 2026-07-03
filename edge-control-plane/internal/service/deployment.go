@@ -205,6 +205,7 @@ type DeploymentService struct {
 	publisher      nats.Publisher
 	appSvc         *AppService
 	envSvc         *EnvService // injected for decryption at publish
+	webhookSvc     *WebhookService // injected for webhook events
 	// defaultRegion is this control plane's own region. Used as the
 	// fallback `regions` list for deployments that don't explicitly
 	// target any region — both in `Deploy` (when the HTTP request
@@ -256,6 +257,10 @@ func (s *DeploymentService) SetAppService(appSvc *AppService) {
 // SetEnvService injects the EnvService used for decrypting env vars at publish.
 func (s *DeploymentService) SetEnvService(envSvc *EnvService) {
 	s.envSvc = envSvc
+}
+
+func (s *DeploymentService) SetWebhookService(webhookSvc *WebhookService) {
+	s.webhookSvc = webhookSvc
 }
 
 // Deploy creates a new deployment and stores the artifact.
@@ -443,6 +448,13 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		return nil, err
 	}
 
+	if s.webhookSvc != nil {
+		s.webhookSvc.PublishEvent(context.Background(), deployment.TenantID, deployment.AppName, "deploy", map[string]string{
+			"deployment_id": deployment.ID,
+			"hash":          deployment.Hash,
+		})
+	}
+
 	return deployment, nil
 }
 
@@ -617,7 +629,15 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 	if len(regions) == 0 {
 		regions = []string{s.defaultRegion}
 	}
-	return s.publishSwap(ctx, tenantID, appName, deploymentID, msg, regions)
+	if err := s.publishSwap(ctx, tenantID, appName, deploymentID, msg, regions); err != nil {
+		return err
+	}
+	if s.webhookSvc != nil {
+		s.webhookSvc.PublishEvent(context.Background(), tenantID, appName, "activate", map[string]string{
+			"deployment_id": deploymentID,
+		})
+	}
+	return nil
 }
 
 // publishSwap fans a TaskMessage out to every region in `regions`,
@@ -902,6 +922,12 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 	}
 	if err := s.publishSwap(ctx, tenantID, appName, rolledBackID, msg, regions); err != nil {
 		return "", err
+	}
+
+	if s.webhookSvc != nil {
+		s.webhookSvc.PublishEvent(context.Background(), tenantID, appName, "rollback", map[string]string{
+			"deployment_id": rolledBackID,
+		})
 	}
 
 	return rolledBackID, nil
