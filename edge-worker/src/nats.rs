@@ -123,19 +123,15 @@ impl NatsClient for NatsClientImpl {
         // queue-group name — NATS load-balances messages across consumers
         // in the same group, preventing duplicate app starts across
         // workers in the same region (issue #86).
+        let deliver_subject = format!("_INBOX.task.{}", consumer_name);
         let config = PushConsumerConfig {
             name: Some(consumer_name.to_string()),
             durable_name: Some(consumer_name.to_string()),
+            deliver_subject,
             deliver_group: Some(queue_group.to_string()),
             ack_policy: jetstream::consumer::AckPolicy::Explicit,
             deliver_policy: jetstream::consumer::DeliverPolicy::All,
             filter_subject: format!("edgecloud.tasks.{}", region),
-            // Bound re-deliveries so a persistently-failing message can't
-            // dead-letter the whole consumer. After this many redeliveries
-            // the server stops sending the message and the worker is
-            // expected to `term()` it. Set high enough that transient
-            // failures (e.g., slow artifact download) have room to recover
-            // before the consumer stalls.
             max_deliver: 20,
             ..Default::default()
         };
