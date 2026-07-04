@@ -186,6 +186,7 @@ impl RuntimeState {
         egress: Arc<EgressPolicy>,
         log_sink: Arc<dyn observe::LogSink>,
         app_ctx: observe::AppLogContext,
+        metrics_acc: Option<Arc<observe::MetricsAccumulator>>,
     ) -> Self {
         let env = Arc::new(env);
         let exit_code = Arc::new(AtomicU32::new(0));
@@ -195,11 +196,13 @@ impl RuntimeState {
 
         let wasi_ctx = build_wasi_ctx_for_tenant(&env, &tenant_id);
 
-        let observer = observe::Observer::from_config(
-            observe::ObserveConfig::new()
-                .with_log_sink(log_sink)
-                .with_app_ctx(app_ctx),
-        );
+        let mut observe_cfg = observe::ObserveConfig::new()
+            .with_log_sink(log_sink)
+            .with_app_ctx(app_ctx);
+        if let Some(acc) = metrics_acc {
+            observe_cfg = observe_cfg.with_metrics_accumulator(acc);
+        }
+        let observer = observe::Observer::from_config(observe_cfg);
 
         Self {
             kv_store,
@@ -445,6 +448,7 @@ mod send_request_tests {
                 tenant_id: "phase-c8-test".to_string(),
                 deployment_id: "phase-c8-test".to_string(),
             },
+            None,
         )
     }
 
@@ -978,6 +982,7 @@ mod with_env_and_meter_tests {
                 tenant_id: tenant_id.to_string(),
                 deployment_id: "test".to_string(),
             },
+            None,
         )
     }
 
