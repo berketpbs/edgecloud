@@ -343,7 +343,6 @@ pub fn render_routes(
     let mut root = serde_json::Map::new();
     let mut http_apps = serde_json::Map::new();
     http_apps.insert("servers".to_string(), Value::Object(servers));
-    http_apps.insert("automatic_https".to_string(), json!({"disable": true}));
     let mut http_block = serde_json::Map::new();
     http_block.insert("http".to_string(), Value::Object(http_apps));
     http_block.insert("tls".to_string(), Value::Object(tls));
@@ -437,12 +436,15 @@ mod tests {
     }
 
     #[test]
-    fn automatic_https_is_disabled_so_wildcard_cert_wins() {
+    fn wildcard_cert_takes_precedence_over_auto_tls() {
         let cache = TrafficSplitCache::default();
         let cfg_json = render_routes(&[], &[], &test_cfg(), &cache);
-        assert_eq!(
-            cfg_json["apps"]["http"]["automatic_https"]["disable"],
-            serde_json::Value::Bool(true)
+        // Caddy 2.11 removed the `app.http.automatic_https` field.
+        // The wildcard cert in `tls.certificates.load_files` takes
+        // precedence automatically — no need to disable auto-TLS.
+        assert!(
+            cfg_json["apps"]["http"]["automatic_https"].is_null(),
+            "render_routes must not emit the removed automatic_https field"
         );
     }
 
