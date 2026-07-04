@@ -211,6 +211,12 @@ pub struct HandlerConfig {
     /// the guest is invoked. `0` disables the cap (NOT RECOMMENDED —
     /// see `Config::handler_max_request_body_bytes`).
     pub max_request_body_bytes: u64,
+    /// Shared metrics accumulator for this app instance. Guest
+    /// `edge:observe` metric calls write into this, and the heartbeat
+    /// builder snapshots it every 30s to populate `observer_metrics`
+    /// on the wire. `None` before the app is running (the accumulator
+    /// is created in `start_app`).
+    pub metrics_acc: Option<Arc<edge_runtime::interfaces::observe::MetricsAccumulator>>,
 }
 
 impl HandlerDispatch {
@@ -492,6 +498,7 @@ impl HandlerDispatch {
             self.config.egress.clone(),
             self.config.log_sink.clone(),
             self.config.app_ctx.clone(),
+            self.config.metrics_acc.clone(),
         );
 
         // Clone the shared exit-code flag BEFORE moving `request_state`

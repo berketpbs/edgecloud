@@ -176,6 +176,7 @@ impl LayerHarness {
             )),
             env: HashMap::new(),
             max_request_body_bytes: 10 * 1024 * 1024,
+            metrics_acc: None,
         };
 
         let dispatch = Arc::new(
@@ -328,6 +329,7 @@ async fn l6_request_body_over_cap_returns_413() {
         )),
         env: HashMap::new(),
         max_request_body_bytes: 100,
+        metrics_acc: None,
     })
     .await;
 
@@ -374,7 +376,8 @@ async fn l6b_request_body_under_cap_reaches_guest() {
             "l6b-deployment".to_string(),
         )),
         env: HashMap::new(),
-        max_request_body_bytes: 10 * 1024 * 1024, // 10 MB — generous
+        max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None, // 10 MB — generous
     })
     .await;
 
@@ -447,6 +450,7 @@ async fn l7_per_request_timeout_returns_500() {
         )),
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
     };
 
     let dispatch = Arc::new(
@@ -635,6 +639,7 @@ async fn l11_guest_calls_process_get_env() {
         )),
         env: HashMap::from([("KV_KEY".into(), "hello-from-host".into())]),
         max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
     })
     .await;
 
@@ -679,6 +684,7 @@ async fn l12_guest_calls_time_now() {
         )),
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
     })
     .await;
 
@@ -727,6 +733,7 @@ async fn l13_guest_calls_kv_store_round_trip() {
         )),
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
     })
     .await;
 
@@ -799,6 +806,7 @@ async fn l14_guest_calls_cache_round_trip() {
         )),
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
     })
     .await;
 
@@ -868,6 +876,7 @@ async fn l15_guest_emit_log_reaches_sink() {
         )),
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
     })
     .await;
 
@@ -924,6 +933,7 @@ async fn l16_guest_schedules_task() {
         )),
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
     })
     .await;
 
@@ -970,6 +980,7 @@ fn test_config(app_name: &str) -> HandlerConfig {
         )),
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
     }
 }
 
@@ -1257,6 +1268,7 @@ async fn l27_process_get_all_env() {
         meter: Arc::new(RequestMeter::new("l27".to_string(), "l27".to_string())),
         env,
         max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
     })
     .await;
     let cl = make_client();
@@ -1339,6 +1351,7 @@ async fn l45_outbound_metering_counts_response_bytes() {
         meter: meter_for_config,
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
     })
     .await;
 

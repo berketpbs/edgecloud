@@ -15,7 +15,9 @@ use crate::detect::{detect_execution_model, ExecutionModel};
 use crate::dispatch::{try_load_tls_config, HandlerConfig, HandlerDispatch};
 use crate::downloader::Downloader;
 use crate::log_forwarder::LogForwarder;
-use crate::messages::{AppSpec, AppStatus, ClusterHeadroom, HeartbeatMessage, TaskMessage};
+use crate::messages::{
+    AppSpec, AppStatus, ClusterHeadroom, HeartbeatMessage, MetricKind, MetricSample, TaskMessage,
+};
 use crate::nats::NatsClient;
 use crate::port_pool::PortPool;
 use crate::state::{AppInstance, AppInstanceStatus, WorkerState};
@@ -275,6 +277,12 @@ impl Supervisor {
             deployment_id: spec.deployment_id.clone(),
         };
 
+        // Shared metrics accumulator — guest edge:observe metric calls
+        // write into this, and build_heartbeat snapshots it every 30s.
+        let metrics_acc: Option<Arc<edge_runtime::interfaces::observe::MetricsAccumulator>> = Some(
+            Arc::new(edge_runtime::interfaces::observe::MetricsAccumulator::new()),
+        );
+
         // Own tenant_id before the spawn — `start_app` borrows it as &str,
         // but the tokio::spawn future must be 'static, so we move an owned
         // String into the closure. The original is moved into the closure;
@@ -314,6 +322,7 @@ impl Supervisor {
                     meter: meter.clone(),
                     env: env.clone(),
                     max_request_body_bytes: self.config.handler_max_request_body_bytes,
+                    metrics_acc: metrics_acc.clone(),
                 };
 
                 let tls_config =
@@ -375,6 +384,7 @@ impl Supervisor {
                 let downloader_clone = self.downloader.clone();
                 let log_forwarder = self.log_forwarder.clone();
                 let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+                let metrics_acc_for_loop = metrics_acc.clone();
 
                 let handle = tokio::spawn(async move {
                     Self::run_app_loop(
@@ -391,6 +401,7 @@ impl Supervisor {
                         allowlist,
                         downloader_clone,
                         log_forwarder,
+                        metrics_acc_for_loop,
                     )
                     .await;
                     tracing::info!(app_name = %app_name_str, "app task exited");
@@ -417,6 +428,7 @@ impl Supervisor {
             ticker: Some(ticker),
             execution_model,
             dispatch,
+            metrics_acc,
         }));
 
         self.state.write().await.apps.insert(
@@ -577,6 +589,7 @@ impl Supervisor {
         allowlist: Option<Vec<String>>,
         downloader: Arc<Downloader>,
         log_forwarder: Arc<LogForwarder>,
+        metrics_acc: Option<Arc<edge_runtime::interfaces::observe::MetricsAccumulator>>,
     ) {
         let mut restart_count = 0u32;
         let max_restarts = 5;
@@ -618,6 +631,7 @@ impl Supervisor {
                         allowlist.clone(),
                         &app_name,
                         &log_forwarder,
+                        metrics_acc.clone(),
                     ),
                 ) => {
                     match result {
@@ -761,6 +775,7 @@ impl Supervisor {
         allowlist: Option<Vec<String>>,
         app_name: &str,
         log_forwarder: &Arc<LogForwarder>,
+        metrics_acc: Option<Arc<edge_runtime::interfaces::observe::MetricsAccumulator>>,
     ) -> anyhow::Result<bool> {
         let engine = instance_pre.engine();
 
@@ -790,6 +805,7 @@ impl Supervisor {
             egress,
             log_forwarder.clone() as Arc<dyn edge_runtime::interfaces::observe::LogSink>,
             app_ctx,
+            metrics_acc,
         );
 
         // Create a store with per-invocation state. The memory cap is plumbed
@@ -864,6 +880,48 @@ impl Supervisor {
                 AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung => Some(1),
             };
             let snap = inst.meter.snapshot();
+
+            // Snapshot the app's MetricsAccumulator (guest edge:observe
+            // metric calls) if one was wired. The three metric kinds
+            // map to MetricKind::Counter, Gauge, and HistogramSample
+            // respectively — matching the heartbeat wire format in
+            // edge-worker/src/messages.rs.
+            let metrics = if let Some(ref acc) = inst.metrics_acc {
+                let msnap = acc.snapshot();
+                let mut samples = Vec::with_capacity(
+                    msnap.counters.len() + msnap.gauges.len() + msnap.histograms.len(),
+                );
+                for c in msnap.counters {
+                    samples.push(MetricSample {
+                        name: c.name,
+                        kind: MetricKind::Counter,
+                        value: c.value as f64,
+                        labels: c.labels,
+                    });
+                }
+                for g in msnap.gauges {
+                    samples.push(MetricSample {
+                        name: g.name,
+                        kind: MetricKind::Gauge,
+                        value: g.value,
+                        labels: g.labels,
+                    });
+                }
+                for (name, entries) in msnap.histograms {
+                    for (value, labels) in entries {
+                        samples.push(MetricSample {
+                            name: name.clone(),
+                            kind: MetricKind::HistogramSample,
+                            value,
+                            labels,
+                        });
+                    }
+                }
+                samples
+            } else {
+                vec![]
+            };
+
             msg.apps.insert(
                 app_name.clone(),
                 AppStatus {
@@ -872,7 +930,7 @@ impl Supervisor {
                     exit_code,
                     request_count: snap.request_count,
                     outbound_bytes: snap.outbound_bytes,
-                    observer_metrics: Vec::new(),
+                    observer_metrics: metrics,
                     tenant_id: inst.tenant_id.clone(),
                     port: inst.port,
                 },
