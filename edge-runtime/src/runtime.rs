@@ -340,16 +340,53 @@ impl WasiHttpHooks for EgressHttpHooks {
                 reason = %reason,
                 "egress denied"
             );
-            // Convert to `ErrorCode::InternalError` (the public
-            // `From<ErrorCode> for HttpError` impl is the only way to
-            // build a typed `HttpError` from outside the crate). The
-            // guest sees an InternalError-equivalent 5xx with the
-            // reason embedded in the diagnostics payload.
             let diagnostics = format!("egress denied: {reason}");
             return Err(HttpError::from(ErrorCode::InternalError(Some(diagnostics))));
         }
-        // Egress allowlist passed — defer to the canonical hyper-based
-        // send_request implementation that wasmtime-wasi-http ships.
+
+        // DNS-rebinding guard: resolve the hostname ourselves and check
+        // each resolved IP against the hard-deny ranges. This catches
+        // attacks where an allowlisted hostname is redirected to a
+        // cloud-metadata IP (169.254.169.254, etc.) via a zero-TTL DNS
+        // record. A rejection here returns 5xx to the guest — the same
+        // as if the host were in the deny list.
+        //
+        // We use std::net::lookup_host (blocking) since this is a sync
+        // WIT host call and we can't move async Send bounds across the
+        // block_on boundary cleanly.
+        if let Some(host_str) = request.uri().host().map(|h| h.to_string()) {
+            if request.uri().scheme_str() != Some("ws") {
+                use std::net::ToSocketAddrs;
+                let addr_str = format!("{}:0", host_str);
+                if let Ok(addrs) = addr_str.to_socket_addrs() {
+                    for addr in addrs {
+                        let ip: std::net::IpAddr = addr.ip();
+                        if let Err(reason) = self.egress.check_resolved_ip(ip) {
+                            tracing::warn!(
+                                tenant_id = %self.tenant_id,
+                                url = %url_str,
+                                ip = %ip,
+                                reason = %reason,
+                                "egress dns-rebinding denied"
+                            );
+                            let diagnostics = format!("egress denied: {reason}");
+                            return Err(HttpError::from(ErrorCode::InternalError(Some(
+                                diagnostics,
+                            ))));
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        tenant_id = %self.tenant_id,
+                        url = %url_str,
+                        "egress dns resolution failed (skipping rebinding check)"
+                    );
+                }
+            }
+        }
+
+        // Egress allowlist + DNS-rebinding check passed — defer to the
+        // canonical hyper-based send_request implementation.
         Ok(default_send_request(request, config))
     }
     // `is_forbidden_header` falls back to the `WasiHttpHooks` default
