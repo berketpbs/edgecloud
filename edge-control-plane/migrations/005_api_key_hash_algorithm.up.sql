@@ -3,9 +3,9 @@
 -- format implicitly in key_hash and the service code had to guess; this
 -- column makes the contract explicit at the schema level.
 --
--- The column is NOT NULL with a CHECK constraint that pins the allowed
--- values. Migration 006 (lookup_hash) already references this column in
--- its backfill WHERE clause; without 005 running first, 006 fails on a
+-- The column has a CHECK constraint that pins the allowed values.
+-- Migration 006 (lookup_hash) already references this column in its
+-- backfill WHERE clause; without 005 running first, 006 fails on a
 -- fresh database.
 
 ALTER TABLE api_keys ADD COLUMN hash_algorithm TEXT;
@@ -19,17 +19,9 @@ UPDATE api_keys SET hash_algorithm = 'sha256'
 UPDATE api_keys SET hash_algorithm = 'argon2id'
  WHERE key_hash LIKE '$argon2id$%';
 
--- Any row with an unrecognized key_hash format is left NULL — that is a
--- pre-existing data-integrity issue, and operators must resolve it before
--- this migration can proceed. We fail loudly rather than guessing.
-DO $$
-DECLARE bad_count INT;
-BEGIN
-    SELECT COUNT(*) INTO bad_count FROM api_keys WHERE hash_algorithm IS NULL;
-    IF bad_count > 0 THEN
-        RAISE EXCEPTION 'cannot backfill hash_algorithm: % api_keys rows have unrecognized key_hash format', bad_count;
-    END IF;
-END $$;
+-- The DO $$ validation is omitted here because rubenv/sql-migrate splits
+-- on semicolons and cannot parse dollar-quoted blocks. Instead, let the
+-- NOT NULL constraint below fail naturally if any rows were missed.
 
 ALTER TABLE api_keys ALTER COLUMN hash_algorithm SET NOT NULL;
 
