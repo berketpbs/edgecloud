@@ -37,11 +37,13 @@
 //! with an interrupt — `handle_request` translates that into a
 //! synthetic 500 response.
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskCtx, Poll};
 use std::time::Duration;
 
 use anyhow::Context;
-use hyper::body::Incoming;
+use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::Request as HyperRequest;
@@ -69,6 +71,49 @@ type HandlerResponseResult = Result<
 >;
 type HandlerResponseSender = tokio::sync::oneshot::Sender<HandlerResponseResult>;
 type HandlerResponseReceiver = tokio::sync::oneshot::Receiver<HandlerResponseResult>;
+
+/// Wraps a [`Body`] and counts every data frame's byte length via
+/// [`RequestMeter::record_outbound_bytes`] so the deployment's heartbeat
+/// reflects actual bytes served (fixes issue #210 — outbound byte metering
+/// was lost when PR #196 deleted `http_server.rs`).
+///
+/// Zero-copy: `CountingBody` never buffers; it only observes frame sizes
+/// as hyper polls them from the inner body.
+struct CountingBody<B> {
+    inner: B,
+    meter: Arc<RequestMeter>,
+}
+
+impl<B: Body + Unpin> Body for CountingBody<B>
+where
+    B::Data: AsRef<[u8]>,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskCtx<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(buf) = frame.data_ref() {
+                    self.meter.record_outbound_bytes(buf.as_ref().len() as u64);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            other => other,
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+}
 
 /// Per-app HTTP dispatcher for a FaaS component.
 ///
@@ -349,7 +394,7 @@ impl HandlerDispatch {
                                 cap = self.config.max_request_body_bytes,
                                 "request body exceeds per-app cap; rejecting 413",
                             );
-                            return Ok(synthetic_413(len, self.config.max_request_body_bytes));
+                            return Ok(synthetic_413(len, self.config.max_request_body_bytes, &self.config.meter));
                         }
                     }
                 }
@@ -427,8 +472,14 @@ impl HandlerDispatch {
         }
         .await;
 
+        let meter = &self.config.meter;
         match receiver.await {
-            Ok(Ok(resp)) => Ok(resp),
+            Ok(Ok(resp)) => Ok(resp.map(|body| {
+                HyperOutgoingBody::new(CountingBody {
+                    inner: body,
+                    meter: meter.clone(),
+                })
+            })),
             Ok(Err(error_code)) => {
                 // Guest exited cleanly via `response-outparam::set`
                 // with an error (e.g. EgressPolicy denial surface
@@ -440,9 +491,10 @@ impl HandlerDispatch {
                     err = %error_code,
                     "guest response_outparam::set returned Err"
                 );
-                Ok(synthetic_500(&format!(
-                    "guest returned error-code: {error_code:?}"
-                )))
+                Ok(synthetic_500(
+                    &format!("guest returned error-code: {error_code:?}"),
+                    meter,
+                ))
             }
             Err(_dropped) => {
                 // Sender dropped without invoking `set` — guest
@@ -467,7 +519,7 @@ impl HandlerDispatch {
                         code = exit_code,
                         "guest called process.exit during handler dispatch"
                     );
-                    return Ok(synthetic_500("guest cleanly exited"));
+                    return Ok(synthetic_500("guest cleanly exited", meter));
                 }
 
                 // Real trap. `dispatch_outcome` has already resolved
@@ -486,7 +538,7 @@ impl HandlerDispatch {
                     err = %e,
                     "guest trap or hang; returning 500"
                 );
-                Ok(synthetic_500(&format!("{e:#}")))
+                Ok(synthetic_500(&format!("{e:#}"), meter))
             }
         }
     }
@@ -517,6 +569,7 @@ fn truncate_diagnostic(diagnostic: &str) -> &str {
 fn synthetic_response(
     status: hyper::StatusCode,
     diagnostic: &str,
+    meter: &Arc<RequestMeter>,
 ) -> HyperResponse<HyperOutgoingBody> {
     use http_body_util::{BodyExt, Full};
     use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -533,37 +586,47 @@ fn synthetic_response(
         .status(status)
         .header(CONTENT_TYPE, "text/plain; charset=utf-8")
         .header(CONTENT_LENGTH, len)
-        .body(HyperOutgoingBody::new(body_wrapped))
+        .body(HyperOutgoingBody::new(CountingBody {
+            inner: body_wrapped,
+            meter: meter.clone(),
+        }))
         .expect("synthetic response: builder with explicit content-length never fails")
 }
 
 /// Build a synthetic 500. See `synthetic_response`.
-fn synthetic_500(diagnostic: &str) -> HyperResponse<HyperOutgoingBody> {
-    synthetic_response(hyper::StatusCode::INTERNAL_SERVER_ERROR, diagnostic)
+fn synthetic_500(diagnostic: &str, meter: &Arc<RequestMeter>) -> HyperResponse<HyperOutgoingBody> {
+    synthetic_response(hyper::StatusCode::INTERNAL_SERVER_ERROR, diagnostic, meter)
 }
 
 /// Build a synthetic 413 Payload Too Large with a diagnostic that
 /// describes the over-cap request. See `synthetic_response`.
-fn synthetic_413(content_length: u64, cap: u64) -> HyperResponse<HyperOutgoingBody> {
+fn synthetic_413(content_length: u64, cap: u64, meter: &Arc<RequestMeter>) -> HyperResponse<HyperOutgoingBody> {
     let diagnostic =
         format!("request body of {content_length} bytes exceeds per-app cap of {cap} bytes");
-    synthetic_response(hyper::StatusCode::PAYLOAD_TOO_LARGE, &diagnostic)
+    synthetic_response(hyper::StatusCode::PAYLOAD_TOO_LARGE, &diagnostic, meter)
 }
 
 #[cfg(test)]
 mod synthetic_response_tests {
     use super::*;
+    use edge_runtime::RequestMeter;
     use hyper::StatusCode;
+
+    fn test_meter() -> Arc<RequestMeter> {
+        Arc::new(RequestMeter::new("t_test".into(), "d_test".into()))
+    }
 
     #[test]
     fn synthetic_500_returns_internal_server_error() {
-        let resp = synthetic_500("something went wrong");
+        let m = test_meter();
+        let resp = synthetic_500("something went wrong", &m);
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
     fn synthetic_500_has_text_content_type() {
-        let resp = synthetic_500("test");
+        let m = test_meter();
+        let resp = synthetic_500("test", &m);
         assert_eq!(
             resp.headers()
                 .get("content-type")
@@ -576,7 +639,8 @@ mod synthetic_response_tests {
 
     #[test]
     fn synthetic_500_has_content_length_header() {
-        let resp = synthetic_500("hello");
+        let m = test_meter();
+        let resp = synthetic_500("hello", &m);
         assert!(resp.headers().get("content-length").is_some());
         let cl: usize = resp
             .headers()
@@ -591,7 +655,8 @@ mod synthetic_response_tests {
 
     #[test]
     fn synthetic_500_content_length_matches_diagnostic_length() {
-        let resp = synthetic_500("abc");
+        let m = test_meter();
+        let resp = synthetic_500("abc", &m);
         let cl: usize = resp
             .headers()
             .get("content-length")
@@ -607,7 +672,8 @@ mod synthetic_response_tests {
     #[test]
     fn synthetic_500_truncates_very_long_diagnostics() {
         let long = "x".repeat(10_000);
-        let resp = synthetic_500(&long);
+        let m = test_meter();
+        let resp = synthetic_500(&long, &m);
         let cl: usize = resp
             .headers()
             .get("content-length")
@@ -622,13 +688,15 @@ mod synthetic_response_tests {
 
     #[test]
     fn synthetic_500_empty_diagnostic_returns_500() {
-        let resp = synthetic_500("");
+        let m = test_meter();
+        let resp = synthetic_500("", &m);
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
     fn synthetic_500_content_length_is_zero_for_empty() {
-        let resp = synthetic_500("");
+        let m = test_meter();
+        let resp = synthetic_500("", &m);
         let cl: usize = resp
             .headers()
             .get("content-length")
@@ -642,13 +710,15 @@ mod synthetic_response_tests {
 
     #[test]
     fn synthetic_413_returns_payload_too_large() {
-        let resp = synthetic_413(1_000_000, 1024);
+        let m = test_meter();
+        let resp = synthetic_413(1_000_000, 1024, &m);
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]
     fn synthetic_413_has_text_content_type() {
-        let resp = synthetic_413(5000, 100);
+        let m = test_meter();
+        let resp = synthetic_413(5000, 100, &m);
         assert_eq!(
             resp.headers()
                 .get("content-type")
@@ -661,13 +731,15 @@ mod synthetic_response_tests {
 
     #[test]
     fn synthetic_413_has_content_length_header() {
-        let resp = synthetic_413(5000, 100);
+        let m = test_meter();
+        let resp = synthetic_413(5000, 100, &m);
         assert!(resp.headers().get("content-length").is_some());
     }
 
     #[test]
     fn synthetic_413_diagnostic_mentions_both_values() {
-        let resp = synthetic_413(5000, 100);
+        let m = test_meter();
+        let resp = synthetic_413(5000, 100, &m);
         // We can't easily read the body without consuming the response,
         // but the content-length is always > 0 for non-empty input.
         let cl: usize = resp
@@ -686,7 +758,8 @@ mod synthetic_response_tests {
 
     #[test]
     fn synthetic_413_handles_large_numbers() {
-        let resp = synthetic_413(u64::MAX, u64::MAX);
+        let m = test_meter();
+        let resp = synthetic_413(u64::MAX, u64::MAX, &m);
         let cl: usize = resp
             .headers()
             .get("content-length")
