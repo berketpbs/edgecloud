@@ -24,6 +24,7 @@ bytes = "1.0"
 futures = "0.3"
 chrono = "0.4"
 edge-runtime = { path = "../edge-runtime" }
+edge-spool = { path = "../edge-spool" }
 wasmtime = { version = "=45.0.3", features = ["component-model", "async", "anyhow"] }
 # `ProxyPre<RuntimeState>` for Handler (FaaS) components — see
 # `src/dispatch.rs`. Pairs with `wasmtime-wasi-http` in edge-runtime.
