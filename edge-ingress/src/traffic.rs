@@ -388,6 +388,7 @@ pub fn spawn_fetcher(
     api_url: String,
     cache: SharedCache,
     internal_token: Option<String>,
+    table: Arc<crate::routing::RoutingTable>,
 ) {
     tokio::spawn(async move {
         let fetch_interval = Duration::from_secs(30);
@@ -395,11 +396,19 @@ pub fn spawn_fetcher(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
+            // Derive the app list from the routing table, not the cache.
+            // The cache starts empty and is only populated by this loop,
+            // so relying on cache.known_apps() creates a chicken-and-egg
+            // bug where no apps are ever fetched (issue #152).
             let apps: Vec<(String, String)> = {
-                let mut cache = cache.write().await;
-                cache.evict_stale();
-                cache.known_apps()
+                let snap = table.snapshot().await;
+                let mut seen = std::collections::HashSet::new();
+                for entry in snap {
+                    seen.insert((entry.tenant_id, entry.app_name));
+                }
+                seen.into_iter().collect()
             };
+            cache.write().await.evict_stale();
             let mut tick_unauthorized_logged = false;
             for (tenant_id, app_name) in apps {
                 let outcome = fetch_app_split(
