@@ -40,6 +40,8 @@ package migrations_test
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -103,9 +105,11 @@ var wantTables = []string{
 //     the same PR so the test reflects the new shape.
 //
 // Note: this asserts column *existence*, not type, nullability, or
-// constraint enforcement. The original migration files remain the
-// source of truth for those properties — this test guards against
-// accidental renames/drops, not against subtle type drift.
+// constraint enforcement. For those, see the sibling maps wantTypes
+// and wantNotNull in this file. Indexes are tracked separately in
+// wantIndexes. The original migration files remain the source of
+// truth for those properties — this test guards against accidental
+// renames/drops, not against subtle type drift.
 var wantColumns = map[string][]string{
 	"tenants": {
 		"id",
@@ -268,6 +272,394 @@ var wantColumns = map[string][]string{
 	},
 }
 
+// IndexExpectation describes one CREATE INDEX statement that must
+// exist in the public schema after the up migrations apply. The
+// helper queries pg_indexes by index name (unique within a schema),
+// then verifies it lives on the expected Table. Column ordering and
+// included columns are NOT asserted — out of scope for this layer.
+type IndexExpectation struct {
+	Table string
+	Name  string
+}
+
+// wantTypes enumerates the PostgreSQL type of each public-schema
+// column. Values are the underlying type names as returned by
+// information_schema.columns.udt_name:
+//
+//	text        → TEXT
+//	int4        → INT / INTEGER
+//	int8        → BIGINT (and BIGSERIAL — the SERIAL-ness lives in
+//	             column_default, not the type itself)
+//	bool        → BOOLEAN
+//	timestamptz → TIMESTAMPTZ
+//	jsonb       → JSONB
+//	_text       → TEXT[]   (PG array convention: leading underscore)
+//	varchar     → VARCHAR(N) — the size is dropped by udt_name
+//	uuid        → UUID
+//
+// One row per (table, column). Inline comments reference the
+// migration number where the column was added so reviewers can trace
+// the contract back to the schema change.
+var wantTypes = map[string]map[string]string{
+	"tenants": {
+		"id":                       "text",
+		"name":                     "text",
+		"plan":                     "text",
+		"allowlisted_destinations": "_text", // 001 — TEXT[]
+		"created_at":               "timestamptz",
+	},
+	"quotas": {
+		"tenant_id":              "text",
+		"max_deployments":        "int4",        // 001
+		"max_apps":               "int4",        // 001
+		"max_workers":            "int4",        // 001
+		"max_memory_mb":          "int4",        // 001
+		"max_outbound_mb":        "int4",        // 001
+		"used_outbound_bytes":    "int8",        // 009_quotas_used_outbound
+		"quota_period_start":     "timestamptz", // 009_quotas_used_outbound
+		"max_requests_per_month": "int4",        // 013
+		"used_request_count":     "int8",        // 013
+	},
+	"api_keys": {
+		"id":             "text",
+		"tenant_id":      "text",
+		"name":           "text",
+		"key_hash":       "text",
+		"role":           "text",
+		"created_at":     "timestamptz",
+		"last_used":      "timestamptz",
+		"expires_at":     "timestamptz",
+		"hash_algorithm": "text", // 005_api_key_hash_algorithm
+		"lookup_hash":    "text", // 006_api_key_lookup_hash
+	},
+	"deployments": {
+		"id":                    "text",
+		"tenant_id":             "text",
+		"app_name":              "text",
+		"status":                "text",
+		"hash":                  "text",
+		"created_at":            "timestamptz",
+		"regions":               "_text", // 008_deployments_regions — TEXT[]
+		"auto_rollback_enabled": "bool",  // 009_add_auto_rollback
+	},
+	"active_deployments": {
+		"tenant_id":               "text",
+		"app_name":                "text",
+		"deployment_id":           "text",
+		"last_good_deployment_id": "text",        // 005_add_last_good
+		"auto_rollback_enabled":   "bool",        // 009_add_auto_rollback
+		"stable_since":            "timestamptz", // 009_add_auto_rollback (nullable)
+		"regions_published":       "_text",       // 010_active_deployments_regions
+		"regions_failed":          "_text",       // 010_active_deployments_regions
+		"last_publish_at":         "timestamptz", // 010_active_deployments_regions (nullable)
+		"last_publish_attempt_id": "uuid",        // 010_active_deployments_regions (nullable)
+	},
+	"app_env": {
+		"tenant_id": "text",
+		"app_name":  "text",
+		"env_key":   "text",
+		"env_value": "text",
+	},
+	"workers": {
+		"id":         "text",
+		"region":     "text",
+		"ip":         "text", // nullable
+		"memory_mb":  "int4",
+		"last_seen":  "timestamptz",
+		"created_at": "timestamptz",
+		"tenant_id":  "text", // 003_workers_tenant_id
+	},
+	"worker_status": {
+		"worker_id":   "text",
+		"apps":        "jsonb",
+		"last_report": "timestamptz",
+	},
+	"apps": {
+		"id":          "text",
+		"tenant_id":   "text",
+		"name":        "text",
+		"description": "text", // nullable
+		"created_at":  "timestamptz",
+	},
+	"logs": {
+		"id":            "int8", // BIGSERIAL — serial-ness in default, type is int8
+		"tenant_id":     "varchar",
+		"deployment_id": "varchar",
+		"app_name":      "varchar",
+		"worker_id":     "varchar",
+		"region":        "varchar",
+		"level":         "varchar",
+		"message":       "text",
+		"labels":        "jsonb",
+		"ts":            "timestamptz",
+	},
+	"app_traffic_splits": {
+		"tenant_id":     "text",
+		"app_name":      "text",
+		"deployment_id": "text",
+		"weight":        "int4", // INTEGER
+		"created_at":    "timestamptz",
+	},
+	"domains": {
+		"id":          "text",
+		"tenant_id":   "text",
+		"app_name":    "text",
+		"fqdn":        "text",
+		"status":      "text",
+		"last_error":  "text", // nullable
+		"created_at":  "timestamptz",
+		"verified_at": "timestamptz", // nullable
+	},
+	"autoscale_events": {
+		"id":            "int8", // BIGSERIAL
+		"created_at":    "timestamptz",
+		"region":        "text",
+		"action":        "text",
+		"from_count":    "int4", // INTEGER
+		"to_count":      "int4", // INTEGER
+		"reason":        "text",
+		"provider_kind": "text",
+		"succeeded":     "bool",
+		"error_message": "text", // nullable
+	},
+	"audit_logs": {
+		"id":          "int8", // BIGSERIAL
+		"tenant_id":   "varchar",
+		"api_key_id":  "varchar",
+		"role":        "varchar",
+		"action":      "varchar",
+		"resource":    "varchar",
+		"resource_id": "text",
+		"details":     "text",
+		"outcome":     "varchar",
+		"error_msg":   "text",
+		"request_ip":  "varchar", // VARCHAR(45)
+		"created_at":  "timestamptz",
+	},
+	"webhooks": {
+		"id":          "varchar", // VARCHAR(64)
+		"tenant_id":   "varchar", // VARCHAR(64)
+		"url":         "text",
+		"secret":      "text",
+		"events":      "_text", // 015 — TEXT[]
+		"description": "text",
+		"enabled":     "bool",
+		"created_at":  "timestamptz",
+	},
+	"webhook_deliveries": {
+		"id":            "int8",    // BIGSERIAL
+		"webhook_id":    "varchar", // VARCHAR(64)
+		"event_type":    "varchar", // VARCHAR(32)
+		"status":        "varchar", // VARCHAR(16)
+		"status_code":   "int4",    // nullable
+		"request_body":  "text",
+		"response_body": "text",
+		"error_msg":     "text",
+		"attempt":       "int4",
+		"max_attempts":  "int4",
+		"created_at":    "timestamptz",
+		"completed_at":  "timestamptz", // nullable
+	},
+}
+
+// wantNotNull enumerates the columns that must have is_nullable='NO'.
+// Stored as map[table][]string — any column in wantColumns but NOT in
+// this map is implicitly asserted to be nullable. PK columns are
+// always NOT NULL by Postgres contract, so they're listed here to make
+// the contract explicit (and to produce a clear failure if a PK is
+// silently dropped via a typo like removing PRIMARY KEY).
+//
+// Update when a migration flips a column from NULL → NOT NULL
+// (add to this map) or NOT NULL → NULL (remove from this map and
+// reference the migration number in the comment).
+var wantNotNull = map[string][]string{
+	"tenants": {
+		"id",
+		"name",
+		"plan",
+		"created_at",
+		// allowlisted_destinations is nullable (DEFAULT '{}' but no NOT NULL).
+	},
+	"quotas": {
+		"tenant_id",
+		"max_deployments",        // 001
+		"max_apps",               // 001
+		"max_workers",            // 001
+		"max_memory_mb",          // 001
+		"max_outbound_mb",        // 001
+		"used_outbound_bytes",    // 009_quotas_used_outbound
+		"quota_period_start",     // 009_quotas_used_outbound
+		"max_requests_per_month", // 013
+		"used_request_count",     // 013
+	},
+	"api_keys": {
+		"id",
+		"tenant_id",
+		"name",
+		"key_hash",
+		"role",
+		"created_at",
+		"hash_algorithm", // 005 — SET NOT NULL after backfill precondition
+		"lookup_hash",    // 007 — SET NOT NULL after null-row precondition
+		// last_used, expires_at are nullable.
+	},
+	"deployments": {
+		"id",
+		"tenant_id",
+		"app_name",
+		"status",
+		"hash",
+		"created_at",
+		"regions",               // 008
+		"auto_rollback_enabled", // 009
+	},
+	"active_deployments": {
+		"tenant_id",
+		"app_name",
+		"deployment_id",
+		"auto_rollback_enabled", // 009
+		"regions_published",     // 010
+		"regions_failed",        // 010
+		// last_good_deployment_id is nullable (per 005 — pre-existing rows have NULL).
+		// stable_since is nullable (declared NULL).
+		// last_publish_at is nullable.
+		// last_publish_attempt_id is nullable.
+	},
+	"app_env": {
+		"tenant_id",
+		"app_name",
+		"env_key",
+		"env_value",
+	},
+	"workers": {
+		"id",
+		"region",
+		"memory_mb",
+		"last_seen",
+		"created_at",
+		"tenant_id", // 003
+		// ip is nullable.
+	},
+	"worker_status": {
+		"worker_id",
+		"apps",
+		"last_report",
+	},
+	"apps": {
+		"id",
+		"tenant_id",
+		"name",
+		"created_at",
+		// description is nullable.
+	},
+	"logs": {
+		"id",
+		"tenant_id",
+		"deployment_id",
+		"app_name",
+		"worker_id",
+		"region",
+		"level",
+		"message",
+		"labels",
+		"ts",
+	},
+	"app_traffic_splits": {
+		"tenant_id",
+		"app_name",
+		"deployment_id",
+		"weight",
+		"created_at",
+	},
+	"domains": {
+		"id",
+		"tenant_id",
+		"app_name",
+		"fqdn",
+		"status",
+		"created_at",
+		// last_error, verified_at are nullable.
+	},
+	"autoscale_events": {
+		"id",
+		"created_at",
+		"region",
+		"action",
+		"from_count",
+		"to_count",
+		"reason",
+		"provider_kind",
+		"succeeded",
+		// error_message is nullable (set when succeeded=false).
+	},
+	"audit_logs": {
+		"id",
+		"tenant_id",
+		"api_key_id",
+		"role",
+		"action",
+		"resource",
+		"resource_id",
+		"details",
+		"outcome",
+		"error_msg",
+		"request_ip",
+		"created_at",
+	},
+	"webhooks": {
+		"id",
+		"tenant_id",
+		"url",
+		"secret",
+		"events",
+		"description",
+		"enabled",
+		"created_at",
+	},
+	"webhook_deliveries": {
+		"id",
+		"webhook_id",
+		"event_type",
+		"status",
+		"request_body",
+		"response_body",
+		"error_msg",
+		"attempt",
+		"max_attempts",
+		"created_at",
+		// status_code, completed_at are nullable.
+	},
+}
+
+// wantIndexes enumerates every CREATE INDEX in the migrations. The
+// helper queries pg_indexes by name (unique within the public schema)
+// and asserts each lives on the expected table. Column ordering and
+// included columns are NOT asserted — out of scope for this layer.
+//
+// Update when a migration creates or renames an index. Inline comments
+// reference the migration number where the index was created.
+var wantIndexes = []IndexExpectation{
+	{Table: "deployments", Name: "idx_deployments_tenant_app"},            // 002_add_indexes
+	{Table: "deployments", Name: "idx_deployments_tenant"},                // 002_add_indexes
+	{Table: "workers", Name: "idx_workers_region"},                        // 002_add_indexes
+	{Table: "api_keys", Name: "idx_api_keys_tenant"},                      // 002_add_indexes
+	{Table: "active_deployments", Name: "idx_active_deployments_tenant"},  // 002_add_indexes
+	{Table: "app_env", Name: "idx_app_env_tenant_app"},                    // 002_add_indexes
+	{Table: "workers", Name: "idx_workers_tenant_id"},                     // 003_workers_tenant_id
+	{Table: "apps", Name: "idx_apps_tenant_id"},                           // 004_apps
+	{Table: "logs", Name: "idx_logs_tenant_app_ts"},                       // 005_logs
+	{Table: "logs", Name: "idx_logs_ts"},                                  // 005_logs
+	{Table: "api_keys", Name: "idx_api_keys_lookup_hash"},                 // 006_api_key_lookup_hash
+	{Table: "app_traffic_splits", Name: "idx_ats_tenant_app"},             // 009_traffic_splits
+	{Table: "domains", Name: "idx_domains_tenant_app"},                    // 010_domains
+	{Table: "domains", Name: "idx_domains_fqdn"},                          // 010_domains
+	{Table: "autoscale_events", Name: "idx_autoscale_events_region_time"}, // 012_autoscale_events
+	{Table: "audit_logs", Name: "idx_audit_logs_tenant_created"},          // 014_audit_logs
+	{Table: "audit_logs", Name: "idx_audit_logs_resource"},                // 014_audit_logs
+	{Table: "webhooks", Name: "idx_webhooks_tenant"},                      // 015_webhooks
+	{Table: "webhook_deliveries", Name: "idx_webhook_deliveries_webhook"}, // 015_webhooks
+}
+
 // TestRoundtrip is the headline acceptance test for the migration
 // directory. Subtests share a single Postgres container + *sqlx.DB so
 // the rollback and reapply steps build on the up pass. Failure in any
@@ -316,6 +708,25 @@ func TestRoundtrip(t *testing.T) {
 		for table, cols := range wantColumns {
 			assertColumnsExist(t, db, table, cols)
 		}
+
+		// Type contract: every column must have the expected PostgreSQL
+		// type. Catches accidental type drift (TEXT → BIGINT, etc.)
+		// that would only fail at runtime when a repository scans into
+		// a Go type that doesn't match.
+		assertColumnTypes(t, db, wantTypes)
+
+		// Nullability contract: every listed column must be NOT NULL.
+		// Columns in wantColumns but not in wantNotNull are implicitly
+		// asserted to be nullable. Catches accidental NOT NULL drops
+		// that would let the application insert NULLs into a column
+		// the business logic treats as required.
+		assertNotNull(t, db, wantNotNull)
+
+		// Index contract: every expected index must exist in the public
+		// schema on the expected table. Catches DROP INDEX typos and
+		// migrations that rename an index without updating dependent
+		// code paths. Column ordering inside each index is NOT checked.
+		assertIndexesExist(t, db, wantIndexes)
 	})
 
 	t.Run("DownReversesAllToVersionZero", func(t *testing.T) {
@@ -433,6 +844,72 @@ func assertColumnsExist(t *testing.T, db *sqlx.DB, table string, columns []strin
 			"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='public' AND table_name=$1 AND column_name=$2",
 			table, col))
 		require.Equalf(t, 1, n, "table %q is missing expected column %q after migrations", table, col)
+	}
+}
+
+// assertColumnTypes verifies each (table, column) pair in types has
+// the expected PostgreSQL udt_name. Single SELECT per column. Catches
+// accidental type drift in a migration (e.g. TEXT → BIGINT, or
+// VARCHAR(45) → INT4). The udt_name values match what wantTypes
+// declares — see that map's doc comment for the encoding rules.
+func assertColumnTypes(t *testing.T, db *sqlx.DB, types map[string]map[string]string) {
+	t.Helper()
+	for table, typeMap := range types {
+		for col, want := range typeMap {
+			var got string
+			require.NoError(t, db.Get(&got, `
+				SELECT udt_name FROM information_schema.columns
+				 WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2`,
+				table, col))
+			require.Equalf(t, want, got,
+				"table %q column %q has udt_name %q, want %q (type drifted in a migration?)",
+				table, col, got, want)
+		}
+	}
+}
+
+// assertNotNull verifies each column in notNullCols has
+// is_nullable='NO'. Columns in wantColumns but NOT in wantNotNull are
+// implicitly asserted to be nullable — if a migration flips a column
+// to NOT NULL, add it here; if it flips to NULL, remove it (and update
+// the inline comment to reference the migration).
+func assertNotNull(t *testing.T, db *sqlx.DB, notNullCols map[string][]string) {
+	t.Helper()
+	for table, cols := range notNullCols {
+		for _, col := range cols {
+			var n int
+			require.NoError(t, db.Get(&n, `
+				SELECT COUNT(*) FROM information_schema.columns
+				 WHERE table_schema = 'public' AND table_name = $1
+				   AND column_name = $2 AND is_nullable = 'NO'`,
+				table, col))
+			require.Equalf(t, 1, n,
+				"table %q column %q should be NOT NULL but isn't (nullability drifted in a migration?)",
+				table, col)
+		}
+	}
+}
+
+// assertIndexesExist verifies each named index lives in the public
+// schema on the expected table. Queries pg_indexes by index name
+// (unique within a schema); the returned tablename must match the
+// expectation. Column ordering, included columns, and uniqueness
+// properties are NOT asserted — out of scope for this layer.
+func assertIndexesExist(t *testing.T, db *sqlx.DB, expected []IndexExpectation) {
+	t.Helper()
+	for _, want := range expected {
+		var tablename string
+		err := db.Get(&tablename, `
+			SELECT tablename FROM pg_indexes
+			 WHERE schemaname = 'public' AND indexname = $1`,
+			want.Name)
+		if errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("expected index %q (on table %q) is missing from public schema (DROPped or renamed in a migration?)", want.Name, want.Table)
+		}
+		require.NoError(t, err)
+		require.Equalf(t, want.Table, tablename,
+			"index %q lives on table %q, want %q (moved to a different table in a migration?)",
+			want.Name, tablename, want.Table)
 	}
 }
 
