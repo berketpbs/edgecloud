@@ -87,6 +87,187 @@ var wantTables = []string{
 	"webhook_deliveries",
 }
 
+// wantColumns enumerates the public-schema columns each table must
+// have after the up migrations apply. Acts as a schema-vs-migration
+// contract: if someone renames a column in a migration, drops one
+// without updating this map, or splits a column across migrations and
+// forgets one of the pieces, the UpAppliesAllAndCreatesTables subtest
+// fails with the exact column that's missing.
+//
+// Update when:
+//   - A migration adds a column to a tracked table → add the column
+//     here, and ideally reference the migration number in the comment
+//     so reviewers can trace the contract back to the schema change.
+//   - A migration adds a new table → add a new entry.
+//   - A migration renames or drops a column → rename/remove here in
+//     the same PR so the test reflects the new shape.
+//
+// Note: this asserts column *existence*, not type, nullability, or
+// constraint enforcement. The original migration files remain the
+// source of truth for those properties — this test guards against
+// accidental renames/drops, not against subtle type drift.
+var wantColumns = map[string][]string{
+	"tenants": {
+		"id",
+		"name",
+		"plan",
+		"allowlisted_destinations",
+		"created_at",
+	},
+	"quotas": {
+		"tenant_id",
+		"max_deployments",        // 001
+		"max_apps",               // 001
+		"max_workers",            // 001
+		"max_memory_mb",          // 001
+		"max_outbound_mb",        // 001
+		"used_outbound_bytes",    // 009_quotas_used_outbound
+		"quota_period_start",     // 009_quotas_used_outbound
+		"max_requests_per_month", // 013
+		"used_request_count",     // 013
+	},
+	"api_keys": {
+		"id",
+		"tenant_id",
+		"name",
+		"key_hash",
+		"role",
+		"created_at",
+		"last_used",
+		"expires_at",
+		"hash_algorithm", // 005_api_key_hash_algorithm
+		"lookup_hash",    // 006_api_key_lookup_hash + 007 NOT NULL
+	},
+	"deployments": {
+		"id",
+		"tenant_id",
+		"app_name",
+		"status",
+		"hash",
+		"created_at",
+		"regions",               // 008_deployments_regions
+		"auto_rollback_enabled", // 009_add_auto_rollback
+	},
+	"active_deployments": {
+		"tenant_id",
+		"app_name",
+		"deployment_id",
+		"last_good_deployment_id", // 005_add_last_good
+		"auto_rollback_enabled",   // 009_add_auto_rollback
+		"stable_since",            // 009_add_auto_rollback
+		"regions_published",       // 010_active_deployments_regions
+		"regions_failed",          // 010_active_deployments_regions
+		"last_publish_at",         // 010_active_deployments_regions
+		"last_publish_attempt_id", // 010_active_deployments_regions
+	},
+	"app_env": {
+		"tenant_id",
+		"app_name",
+		"env_key",
+		"env_value",
+	},
+	"workers": {
+		"id",
+		"region",
+		"ip",
+		"memory_mb",
+		"last_seen",
+		"created_at",
+		"tenant_id", // 003_workers_tenant_id
+	},
+	"worker_status": {
+		"worker_id",
+		"apps",
+		"last_report",
+	},
+	"apps": {
+		"id",
+		"tenant_id",
+		"name",
+		"description",
+		"created_at",
+	},
+	"logs": {
+		"id",
+		"tenant_id",
+		"deployment_id",
+		"app_name",
+		"worker_id",
+		"region",
+		"level",
+		"message",
+		"labels",
+		"ts",
+	},
+	"app_traffic_splits": {
+		"tenant_id",
+		"app_name",
+		"deployment_id",
+		"weight",
+		"created_at",
+	},
+	"domains": {
+		"id",
+		"tenant_id",
+		"app_name",
+		"fqdn",
+		"status",
+		"last_error",
+		"created_at",
+		"verified_at",
+	},
+	"autoscale_events": {
+		"id",
+		"created_at",
+		"region",
+		"action",
+		"from_count",
+		"to_count",
+		"reason",
+		"provider_kind",
+		"succeeded",
+		"error_message",
+	},
+	"audit_logs": {
+		"id",
+		"tenant_id",
+		"api_key_id",
+		"role",
+		"action",
+		"resource",
+		"resource_id",
+		"details",
+		"outcome",
+		"error_msg",
+		"request_ip",
+		"created_at",
+	},
+	"webhooks": {
+		"id",
+		"tenant_id",
+		"url",
+		"secret",
+		"events",
+		"description",
+		"enabled",
+		"created_at",
+	},
+	"webhook_deliveries": {
+		"id",
+		"webhook_id",
+		"event_type",
+		"status",
+		"status_code",
+		"request_body",
+		"response_body",
+		"error_msg",
+		"attempt",
+		"max_attempts",
+		"created_at",
+		"completed_at",
+	},
+}
+
 // TestRoundtrip is the headline acceptance test for the migration
 // directory. Subtests share a single Postgres container + *sqlx.DB so
 // the rollback and reapply steps build on the up pass. Failure in any
@@ -126,6 +307,14 @@ func TestRoundtrip(t *testing.T) {
 
 		for _, want := range wantTables {
 			assertTableExists(t, db, want)
+		}
+
+		// Column-level contract: every expected column on every tracked
+		// table must exist. Catches accidental renames/drops in a
+		// migration that would otherwise leave the schema silently
+		// drifting from what the Go repositories expect.
+		for table, cols := range wantColumns {
+			assertColumnsExist(t, db, table, cols)
 		}
 	})
 
@@ -234,6 +423,17 @@ func assertTableAbsent(t *testing.T, db *sqlx.DB, name string) {
 		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_name=$1",
 		name))
 	require.Equalf(t, 0, n, "table %q still present after rollback to v0", name)
+}
+
+func assertColumnsExist(t *testing.T, db *sqlx.DB, table string, columns []string) {
+	t.Helper()
+	for _, col := range columns {
+		var n int
+		require.NoError(t, db.Get(&n,
+			"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='public' AND table_name=$1 AND column_name=$2",
+			table, col))
+		require.Equalf(t, 1, n, "table %q is missing expected column %q after migrations", table, col)
+	}
 }
 
 // assertMigrationsLexicallyOrdered guards against two classes of bug:
