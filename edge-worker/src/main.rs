@@ -52,14 +52,21 @@ async fn main() -> anyhow::Result<()> {
         config.worker_tenant_id.clone(),
     );
 
+    // Initialize disk spool for log durability — failed HTTP batches are
+    // persisted here and replayed on the next startup.
+    let spool = edge_spool::Spool::open(&std::path::PathBuf::from(".worker-spool"))
+        .await
+        .ok();
+
     // Initialize LogForwarder — receives tenant `emit_log` records from the
     // runtime AND worker-side `tracing` events via WorkerLogLayer. One per
     // worker; per-app AppLogContext travels with each guest record.
-    let log_forwarder = LogForwarder::new(
+    let log_forwarder = LogForwarder::new_with_spool(
         config.control_plane_url.clone(),
         config.worker_id.clone(),
         config.region.clone(),
         jwt_signer.clone(),
+        spool,
     );
 
     // Without a JWT secret the worker can still run — NATS heartbeats and
@@ -241,6 +248,11 @@ async fn main() -> anyhow::Result<()> {
     });
 
     tracing::info!("heartbeat task started");
+
+    // Replay any spooled log batches from a previous run before the
+    // regular flush loop starts, so failed batches from a prior crash
+    // are retried before new entries accumulate.
+    log_forwarder.replay_spool().await;
 
     // Spawn the log-forwarder flush loop. It listens on the same shutdown
     // broadcast as the heartbeat task; on shutdown it does one final flush
