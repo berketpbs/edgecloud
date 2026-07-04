@@ -255,7 +255,22 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *natsio.Msg) {
 		LastReport: hb.Timestamp,
 	}
 	if err := s.workerRepo.UpsertStatus(ctx, ws); err != nil {
-		log.Printf("heartbeat: failed to upsert status for %s: %v", hb.WorkerID, err)
+		// The FK constraint `worker_status_worker_id_fkey` fires when
+		// the worker hasn't been registered yet. Auto-register with a
+		// skeleton row so the status can be persisted (issue #283).
+		if strings.Contains(err.Error(), "worker_status_worker_id_fkey") && hb.TenantID != "" {
+			log.Printf("heartbeat: auto-registering unregistered worker %s (region=%s, tenant=%s)", hb.WorkerID, hb.Region, hb.TenantID)
+			if _, regErr := s.workerRepo.Upsert(ctx, hb.TenantID, &domain.RegisterWorkerRequest{
+				WorkerID: hb.WorkerID,
+				Region:   hb.Region,
+			}); regErr != nil {
+				log.Printf("heartbeat: failed to auto-register worker %s: %v", hb.WorkerID, regErr)
+			} else if retryErr := s.workerRepo.UpsertStatus(ctx, ws); retryErr != nil {
+				log.Printf("heartbeat: failed to upsert status for %s after auto-register: %v", hb.WorkerID, retryErr)
+			}
+		} else {
+			log.Printf("heartbeat: failed to upsert status for %s: %v", hb.WorkerID, err)
+		}
 	}
 
 	// Stability-window evaluate. Only fires when the heartbeat
