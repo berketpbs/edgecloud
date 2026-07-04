@@ -53,7 +53,7 @@ func main() {
 	if err := publisher.EnsureStream(nats.StreamConfig{
 		Name:      nats.TaskStreamName,
 		Subjects:  []string{"edgecloud.tasks.>"},
-		Retention: natsio.WorkQueuePolicy,
+		Retention: natsio.InterestPolicy,
 		MaxAge:    24 * time.Hour,
 		Replicas:  3,
 	}); err != nil {

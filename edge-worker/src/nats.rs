@@ -80,7 +80,8 @@ impl NatsClientImpl {
 
     /// Idempotently create the tasks stream if it does not exist.
     ///
-    /// Matches the whitepaper §8.4 contract: workqueue retention, 24h max
+    /// Matches the whitepaper §8.4 contract: interest retention (allows
+    /// per-region consumers with different filter subjects), 24h max
     /// age, replication factor 3. Safe to call from both the worker and
     /// the control plane.
     pub async fn ensure_task_stream(&self) -> anyhow::Result<()> {
@@ -88,7 +89,7 @@ impl NatsClientImpl {
         js.get_or_create_stream(StreamConfig {
             name: TASK_STREAM.to_string(),
             subjects: vec![TASK_SUBJECT_WILDCARD.to_string()],
-            retention: RetentionPolicy::WorkQueue,
+            retention: RetentionPolicy::Interest,
             max_age: Duration::from_secs(24 * 60 * 60),
             num_replicas: 3,
             ..Default::default()
