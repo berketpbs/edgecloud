@@ -6,6 +6,7 @@ package app
 import (
 	"context"
 	"embed"
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
@@ -190,12 +191,29 @@ func New(
 	// internal operator access only. Do not expose this path on the public LB.
 	mux.HandleFunc("GET /metrics", metricsHandler.GetAllMetrics)
 
-	// Health check
+	// Health check — pings the database (and optionally NATS) so load
+	// balancers and orchestrators stop routing traffic to a control plane
+	// instance with a dead database connection (issue #142).
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		if _, err := w.Write([]byte(`{"status":"ok"}`)); err != nil {
-			log.Printf("Health check: failed to write response: %v", err)
+		if err := db.PingContext(r.Context()); err != nil {
+			log.Printf("Health check: DB ping failed: %v", err)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "unhealthy", "error": err.Error()})
+			return
 		}
+		// Optional NATS connectivity check. A NATS outage doesn't kill
+		// the API server (it still serves reads), but surfacing it in
+		// the health check gives operators an early signal.
+		if nc := publisher.Conn(); nc != nil {
+			if err := nc.FlushTimeout(2 * time.Second); err != nil {
+				log.Printf("Health check: NATS ping failed: %v", err)
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(map[string]string{"status": "unhealthy", "error": err.Error()})
+				return
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 
 	// OpenAPI spec — served as raw YAML
