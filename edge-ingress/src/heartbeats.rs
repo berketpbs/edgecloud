@@ -62,6 +62,7 @@ pub async fn run(
         cfg.control_plane_api_url.clone(),
         traffic_cache.clone(),
         cfg.internal_token.clone(),
+        table.clone(),
     );
     spawn_renderer(
         cfg.clone(),
