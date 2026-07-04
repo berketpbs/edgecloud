@@ -52,6 +52,10 @@ pub struct Config {
     pub service_token: String,
     /// How often to poll `/api/internal/domains` (default 30s).
     pub domain_poll_interval: Duration,
+    /// Listen address for Caddy's admin API (e.g. `localhost:2019` or
+    /// `0.0.0.0:2019` for Docker). Defaults to `localhost:2019` which
+    /// matches Caddy's own default. Override with `CADDY_ADMIN_LISTEN`.
+    pub caddy_admin_listen: String,
 }
 
 impl Config {
@@ -116,6 +120,8 @@ impl Config {
             control_plane_url,
             service_token,
             domain_poll_interval,
+            caddy_admin_listen: std::env::var("CADDY_ADMIN_LISTEN")
+                .unwrap_or_else(|_| "localhost:2019".into()),
         })
     }
 }

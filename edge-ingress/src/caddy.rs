@@ -341,6 +341,13 @@ pub fn render_routes(
     }
 
     let mut root = serde_json::Map::new();
+    // Preserve the admin binding across POST /load reloads. Without
+    // this, Caddy resets to its default `localhost:2019` (inside the
+    // container), breaking the next reload from the host.
+    root.insert(
+        "admin".to_string(),
+        json!({"listen": cfg.caddy_admin_listen}),
+    );
     let mut http_apps = serde_json::Map::new();
     http_apps.insert("servers".to_string(), Value::Object(servers));
     let mut http_block = serde_json::Map::new();
@@ -414,6 +421,7 @@ mod tests {
             control_plane_url: String::new(),
             service_token: String::new(),
             domain_poll_interval: Duration::from_secs(30),
+            caddy_admin_listen: "localhost:2019".into(),
         }
     }
 
@@ -445,6 +453,19 @@ mod tests {
         assert!(
             cfg_json["apps"]["http"]["automatic_https"].is_null(),
             "render_routes must not emit the removed automatic_https field"
+        );
+    }
+
+    #[test]
+    fn admin_block_is_emitted_so_caddy_binding_persists_across_reloads() {
+        let cache = TrafficSplitCache::default();
+        let mut cfg = test_cfg();
+        cfg.caddy_admin_listen = "0.0.0.0:2019".into();
+        let cfg_json = render_routes(&[], &[], &cfg, &cache);
+        assert_eq!(
+            cfg_json["admin"]["listen"], "0.0.0.0:2019",
+            "render_routes must include admin.listen matching Config so \
+             POST /load does not reset Caddy's admin binding"
         );
     }
 
