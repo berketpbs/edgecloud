@@ -256,6 +256,12 @@ enum Command {
         /// to [1, 1000]; default 100.
         #[arg(long, default_value_t = 100)]
         limit: u32,
+
+        /// Offset for pagination. Use to page through older entries.
+        /// Pagination is offset-based; the server returns a
+        /// `next_offset` hint when more results exist.
+        #[arg(long, value_name = "N")]
+        offset: Option<u32>,
     },
 
     /// Manage authentication (signup, login, whoami, logout).
@@ -374,9 +380,18 @@ fn main() -> Result<()> {
             level,
             follow,
             limit,
+            offset,
         } => {
             let since_dur = parse_since(&since)?;
-            commands::logs::run(&cli.path, &app, since_dur, level.as_deref(), follow, limit)
+            commands::logs::run(
+                &cli.path,
+                &app,
+                since_dur,
+                level.as_deref(),
+                follow,
+                limit,
+                offset,
+            )
         }
         Command::Auth { action } => action.run(),
         Command::Traffic { action } => match action {
