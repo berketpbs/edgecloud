@@ -500,6 +500,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/keys/{keyID}/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Rotate an API key (generate new key, expire old one) */
+        post: operations["rotateAPIKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/egress": {
         parameters: {
             query?: never;
@@ -2650,6 +2667,32 @@ export interface operations {
                 content?: never;
             };
             401: components["responses"]["Unauthorized"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    rotateAPIKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The API key ID to rotate. */
+                keyID: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description New API key created. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateAPIKeyResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
             500: components["responses"]["InternalError"];
         };
     };
