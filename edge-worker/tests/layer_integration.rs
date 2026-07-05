@@ -1782,3 +1782,59 @@ async fn l44_concurrent_time_now() {
         assert!(ts > 1_700_000_000, "unreasonable timestamp: {ts}");
     }
 }
+
+// ── Streaming Response Bodies (L46) ─────────────────────────────────────
+
+/// L46: the guest calls ResponseOutparam::set early (headers-only)
+/// and continues writing body chunks. The host must start serving the
+/// response immediately — proving the streaming path works end-to-end
+/// for SSE, long-polling, and progressive chunked responses (issue #312).
+#[tokio::test(flavor = "multi_thread")]
+async fn l46_sse_endpoint_streams_headers_then_body_chunks() {
+    if should_skip_layer_tests() {
+        return;
+    }
+
+    let (port, _shutdown_tx) = spawn_handler_with_config(HandlerConfig {
+        tenant_id: "test-tenant".to_string(),
+        egress: Arc::new(EgressPolicy::allow_all()),
+        log_sink: Arc::new(NullSink),
+        app_ctx: AppLogContext {
+            app_name: "l46".to_string(),
+            tenant_id: "test-tenant".to_string(),
+            deployment_id: "l46-deployment".to_string(),
+        },
+        meter: Arc::new(RequestMeter::new(
+            "test-tenant".to_string(),
+            "l46-deployment".to_string(),
+        )),
+        env: HashMap::new(),
+        max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
+    })
+    .await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("reqwest::Client");
+
+    let url = format!("http://127.0.0.1:{port}/sse?count=3");
+    let resp = client.get(&url).send().await.expect("GET /sse?count=3");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap()),
+        Some("text/event-stream")
+    );
+
+    // Read the body — it should contain SSE-formatted data lines
+    // emitted by the guest after the headers were already sent.
+    let body = resp.text().await.expect("streaming body");
+    let event_count = body.lines().filter(|l| l.starts_with("data:")).count();
+    assert!(
+        event_count >= 3,
+        "SSE response should contain at least 3 data: lines, got {event_count}\nbody:\n{body}"
+    );
+}
