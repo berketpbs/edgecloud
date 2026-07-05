@@ -1,0 +1,43 @@
+name: Preview
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  deploy-preview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Build wasm
+        run: cargo build --target wasm32-wasip2 --release 2>&1 | tail -5
+
+      - name: Deploy preview
+        id: deploy
+        env:
+          EDGE_API_KEY: ${{ secrets.EDGECLOUD_API_KEY }}
+          EDGE_API_URL: ${{ secrets.EDGECLOUD_API_URL }}
+        run: |
+          if [ -z "$EDGE_API_KEY" ]; then
+            echo "no api key configured — skipping preview deploy"
+            echo "preview-url=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          cargo run -p edge-cli -- deploy --preview 2>&1 | tee /tmp/preview-output.txt
+
+      - name: Comment PR
+        if: steps.deploy.outputs.preview-url != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🚀 Preview deployed at: ${{ steps.deploy.outputs.preview-url }}`
+            })
