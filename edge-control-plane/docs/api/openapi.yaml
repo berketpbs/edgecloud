@@ -2532,6 +2532,57 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  # -------------------------------------------------------------------------
+  # Secrets key management (internal auth)
+  # -------------------------------------------------------------------------
+  /api/v1/admin/secrets/keys:
+    get:
+      operationId: listSecretsKeys
+      summary: List key IDs in the secrets keyring
+      security:
+        - InternalTokenAuth: []
+      responses:
+        '200':
+          description: Key IDs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  key_ids:
+                    type: array
+                    items:
+                      type: string
+                  active_key:
+                    type: string
+                  encryption_enabled:
+                    type: boolean
+        '401':
+          description: Missing or invalid internal token
+
+  /api/v1/admin/secrets/re-encrypt:
+    post:
+      operationId: reEncryptSecrets
+      summary: Re-encrypt all env values with the active key
+      security:
+        - InternalTokenAuth: []
+      responses:
+        '200':
+          description: Re-encryption complete
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  re_encrypted:
+                    type: integer
+                  status:
+                    type: string
+        '400':
+          description: Encryption not configured
+        '500':
+          description: Re-encryption failed
+
   /api/v1/internal/traffic/{tenantID}/{appName}:
     get:
       summary: Internal traffic split lookup
