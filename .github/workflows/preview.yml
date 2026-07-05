@@ -14,21 +14,22 @@ jobs:
         with:
           targets: wasm32-wasip2
 
-      - name: Build wasm
-        run: cargo build --target wasm32-wasip2 --release 2>&1 | tail -5
-
-      - name: Deploy preview
+      # Delegate install-cli + cargo build + edge deploy + URL capture
+      # to the reusable composite action. The composite declares
+      # `preview-url` as an output, which the next step consumes via
+      # `${{ steps.deploy.outputs.preview-url }}` (the `id: deploy`
+      # here is the workflow's reference into the action's outputs,
+      # not an internal step in the composite).
+      #
+      # Fork PRs do not receive `secrets.EDGECLOUD_API_KEY` — the
+      # composite treats an empty API key as a no-op (writes empty
+      # `preview-url`), and the `Comment PR` step's `if:` skips on
+      # empty string. No secrets leak, no spurious failure.
+      - uses: ./.github/actions/deploy-preview
         id: deploy
-        env:
-          EDGE_API_KEY: ${{ secrets.EDGECLOUD_API_KEY }}
-          EDGE_API_URL: ${{ secrets.EDGECLOUD_API_URL }}
-        run: |
-          if [ -z "$EDGE_API_KEY" ]; then
-            echo "no api key configured — skipping preview deploy"
-            echo "preview-url=" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          cargo run -p edge-cli -- deploy --preview 2>&1 | tee /tmp/preview-output.txt
+        with:
+          api-key: ${{ secrets.EDGECLOUD_API_KEY }}
+          api-url: ${{ secrets.EDGECLOUD_API_URL }}
 
       - name: Comment PR
         if: steps.deploy.outputs.preview-url != ''
