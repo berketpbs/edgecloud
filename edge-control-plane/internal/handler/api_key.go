@@ -22,15 +22,16 @@ func NewAPIKeyHandler(apiKeySvc service.APIKeyServiceInterface) *APIKeyHandler {
 }
 
 type CreateAPIKeyRequest struct {
-	Name string `json:"name"`
-	Role string `json:"role"`
+	Name     string `json:"name"`
+	Role     string `json:"role"`
+	TTLHours *int   `json:"ttl_hours,omitempty"` // nil = never expires
 }
 
 type CreateAPIKeyResponse struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Role  string `json:"role"`
-	Token string `json:"token"` // Raw key shown only once
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Role      string `json:"role"`
+	Token     string `json:"token"` // Raw key shown only once
 }
 
 func (h *APIKeyHandler) Create(w http.ResponseWriter, r *http.Request) {
@@ -58,7 +59,7 @@ func (h *APIKeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 		role = domain.RoleDeveloper
 	}
 
-	apiKey, rawKey, err := h.apiKeySvc.CreateAPIKey(r.Context(), tenantID, req.Name, role)
+	apiKey, rawKey, err := h.apiKeySvc.CreateAPIKey(r.Context(), tenantID, req.Name, role, req.TTLHours)
 	if err != nil {
 		log.Printf("internal error: %v", err)
 		httperror.InternalErrorCtx(w, r)
@@ -87,21 +88,9 @@ func (h *APIKeyHandler) List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Don't expose key_hash
-	type keyInfo struct {
-		ID        string `json:"id"`
-		Name      string `json:"name"`
-		Role      string `json:"role"`
-		CreatedAt string `json:"created_at"`
-	}
-	infos := make([]keyInfo, len(keys))
+	infos := make([]domain.SafeAPIKeyResponse, len(keys))
 	for i, k := range keys {
-		infos[i] = keyInfo{
-			ID:        k.ID,
-			Name:      k.Name,
-			Role:      k.Role,
-			CreatedAt: k.CreatedAt.Format("2006-01-02T15:04:05Z"),
-		}
+		infos[i] = k.ToSafeResponse()
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -111,8 +100,13 @@ func (h *APIKeyHandler) List(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *APIKeyHandler) Delete(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetTenantID(r.Context())
 	keyID := r.PathValue("keyID")
-	if err := h.apiKeySvc.DeleteAPIKey(r.Context(), keyID); err != nil {
+	if err := h.apiKeySvc.DeleteAPIKey(r.Context(), tenantID, keyID); err != nil {
+		if errors.Is(err, service.ErrAPIKeyNotFound) {
+			httperror.NotFoundCtx(w, r, "api key not found")
+			return
+		}
 		httperror.InternalErrorCtx(w, r)
 		return
 	}
@@ -143,8 +137,38 @@ func (h *APIKeyHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(key); err != nil {
+	if err := json.NewEncoder(w).Encode(key.ToSafeResponse()); err != nil {
 		log.Printf("Update API key: failed to encode response: %v", err)
 	}
 	auditRecord(r, "update", "api_key", keyID, "api key "+keyID+" updated", "success")
+}
+
+// Rotate handles POST /api/v1/keys/{keyID}/rotate — invalidates the old key
+// and returns a new one with the same name and role.
+func (h *APIKeyHandler) Rotate(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetTenantID(r.Context())
+	keyID := r.PathValue("keyID")
+
+	newKey, rawKey, err := h.apiKeySvc.RotateAPIKey(r.Context(), tenantID, keyID)
+	if err != nil {
+		if errors.Is(err, service.ErrAPIKeyNotFound) {
+			httperror.NotFoundCtx(w, r, "api key not found")
+			return
+		}
+		log.Printf("internal error: %v", err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	if err := json.NewEncoder(w).Encode(CreateAPIKeyResponse{
+		ID:    newKey.ID,
+		Name:  newKey.Name,
+		Role:  newKey.Role,
+		Token: rawKey,
+	}); err != nil {
+		log.Printf("Rotate API key: failed to encode response: %v", err)
+	}
+	auditRecord(r, "rotate", "api_key", keyID, "api key "+keyID+" rotated to "+newKey.ID, "success")
 }

@@ -57,7 +57,8 @@ func (s *APIKeyService) SetAPIKeyRepo(r APIKeyRepo) *APIKeyService {
 //
 // Keys are stored as argon2id hashes (PHC-formatted). The raw key is returned
 // to the caller exactly once and is never persisted.
-func (s *APIKeyService) CreateAPIKey(ctx context.Context, tenantID, name, role string) (*domain.APIKey, string, error) {
+// ttlHours controls when the key expires: nil = never expires, non-nil = N hours.
+func (s *APIKeyService) CreateAPIKey(ctx context.Context, tenantID, name, role string, ttlHours *int) (*domain.APIKey, string, error) {
 	if !domain.IsValidRole(role) {
 		return nil, "", fmt.Errorf("invalid role: %s", role)
 	}
@@ -65,6 +66,11 @@ func (s *APIKeyService) CreateAPIKey(ctx context.Context, tenantID, name, role s
 	rawKey, apiKey, err := mintAPIKey(tenantID, name, role)
 	if err != nil {
 		return nil, "", err
+	}
+
+	if ttlHours != nil && *ttlHours > 0 {
+		exp := time.Now().Add(time.Duration(*ttlHours) * time.Hour)
+		apiKey.ExpiresAt = &exp
 	}
 
 	if err := s.apiKeyRepo.Create(ctx, apiKey); err != nil {
@@ -152,11 +158,12 @@ func (s *APIKeyService) ListAPIKeys(ctx context.Context, tenantID string) ([]dom
 // APIKeyServiceInterface abstracts API key operations for testing.
 // *APIKeyService satisfies this interface.
 type APIKeyServiceInterface interface {
-	CreateAPIKey(ctx context.Context, tenantID, name, role string) (*domain.APIKey, string, error)
+	CreateAPIKey(ctx context.Context, tenantID, name, role string, ttlHours *int) (*domain.APIKey, string, error)
 	ListAPIKeys(ctx context.Context, tenantID string) ([]domain.APIKey, error)
 	GetByID(ctx context.Context, id string) (*domain.APIKey, error)
-	DeleteAPIKey(ctx context.Context, id string) error
+	DeleteAPIKey(ctx context.Context, tenantID, id string) error
 	UpdateAPIKey(ctx context.Context, id, tenantID string, req *domain.UpdateAPIKeyRequest) (*domain.APIKey, error)
+	RotateAPIKey(ctx context.Context, tenantID, id string) (*domain.APIKey, string, error)
 }
 
 // GetByID returns a single API key by its prefixed ID (e.g. "k_<uuid>").
@@ -165,8 +172,48 @@ func (s *APIKeyService) GetByID(ctx context.Context, id string) (*domain.APIKey,
 	return s.apiKeyRepo.GetByID(ctx, id)
 }
 
-func (s *APIKeyService) DeleteAPIKey(ctx context.Context, id string) error {
+// DeleteAPIKey deletes an API key, verifying it belongs to the requesting tenant.
+func (s *APIKeyService) DeleteAPIKey(ctx context.Context, tenantID, id string) error {
+	key, err := s.apiKeyRepo.GetByID(ctx, id)
+	if err != nil {
+		return fmt.Errorf("getting api key: %w", err)
+	}
+	if key == nil || key.TenantID != tenantID {
+		return ErrAPIKeyNotFound
+	}
 	return s.apiKeyRepo.Delete(ctx, id)
+}
+
+// RotateAPIKey expires the old key and creates a new one with the same name and role.
+// The old key is immediately invalidated by setting its ExpiresAt in the past.
+// Returns the new API key and raw key.
+func (s *APIKeyService) RotateAPIKey(ctx context.Context, tenantID, id string) (*domain.APIKey, string, error) {
+	oldKey, err := s.apiKeyRepo.GetByID(ctx, id)
+	if err != nil {
+		return nil, "", fmt.Errorf("getting api key: %w", err)
+	}
+	if oldKey == nil || oldKey.TenantID != tenantID {
+		return nil, "", ErrAPIKeyNotFound
+	}
+
+	// Create new key with same name and role.
+	rawKey, newKey, err := mintAPIKey(tenantID, oldKey.Name, oldKey.Role)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Expire the old key immediately.
+	now := time.Now()
+	oldKey.ExpiresAt = &now
+	if err := s.apiKeyRepo.Update(ctx, oldKey); err != nil {
+		return nil, "", fmt.Errorf("expiring old api key: %w", err)
+	}
+
+	if err := s.apiKeyRepo.Create(ctx, newKey); err != nil {
+		return nil, "", fmt.Errorf("creating new api key: %w", err)
+	}
+
+	return newKey, rawKey, nil
 }
 
 // AuthenticateRawKey looks up a key by its stable SHA-256 lookup hash and
