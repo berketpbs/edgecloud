@@ -11,15 +11,29 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-wasip2
 
-      # Delegate install-cli + cargo build + edge deploy + URL capture
-      # to the reusable composite action. The composite declares
-      # `preview-url` as an output, which the next step consumes via
-      # `${{ steps.deploy.outputs.preview-url }}` (the `id: deploy`
-      # here is the workflow's reference into the action's outputs,
-      # not an internal step in the composite).
+      # Delegate install-cli + edge deploy + URL capture to the
+      # reusable composite action. We pass `build: 'false'` because
+      # this repo doesn't contain a deployable sample wasm app —
+      # the workspace members are all host-only Rust crates
+      # (edge-runtime, edge-worker, edge-cli, edge-migrate, …) that
+      # don't compile for wasm32-wasip2. The only wasm fixture is
+      # edge-worker/tests/fixtures/handler/ which uses
+      # wasm32-unknown-unknown + manual `wasm-tools component new`
+      # for host-side integration testing, not deployable previews.
+      #
+      # Result: this workflow's `edge deploy --preview` step will
+      # fail at "no artifact at target/wasm32-wasip2/release/<app>.wasm"
+      # until a real sample wasm app is added. The Comment PR step
+      # is gated on `preview-url != ''` so it skips cleanly on the
+      # missing-artifact path; the deploy failure is the signal
+      # (visible in the run UI) that a sample app needs adding.
+      #
+      # To wire up a real sample app later: add `samples/hello/`
+      # with a Cargo.toml `crate-type = ["cdylib"]` package, switch
+      # this step's `build` input back to `'true'`, and update
+      # `app_name` (or pass it via a new composite input) so the
+      # artifact lands at the path `edge deploy` expects.
       #
       # Fork PRs do not receive `secrets.EDGECLOUD_API_KEY` — the
       # composite treats an empty API key as a no-op (writes empty
@@ -30,6 +44,7 @@ jobs:
         with:
           api-key: ${{ secrets.EDGECLOUD_API_KEY }}
           api-url: ${{ secrets.EDGECLOUD_API_URL }}
+          build: 'false'
 
       - name: Comment PR
         if: steps.deploy.outputs.preview-url != ''
