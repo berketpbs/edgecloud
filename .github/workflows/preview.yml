@@ -1,0 +1,79 @@
+name: Preview
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  deploy-preview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # Build the hello sample (samples/hello/) into a deployable wasm
+      # component. The two-step build is required because of a
+      # WIT-version mismatch between `wasm32-wasip2` (which embeds
+      # wit-component 0.241.x and emits wasi:http/types@0.2.4) and the
+      # runtime (wasmtime 45.0.3, which expects @0.2.1). Building the
+      # core wasm module with `wasm32-unknown-unknown` + wrapping with
+      # `wasm-tools component new` is the only path that matches today.
+      # See samples/hello/README.md for the full rationale.
+      - name: Build wasm (core module)
+        run: |
+          cargo build \
+            --manifest-path samples/hello/Cargo.toml \
+            --target wasm32-unknown-unknown \
+            --release
+
+      - name: Install wasm-tools
+        run: cargo install wasm-tools --locked
+
+      - name: Wrap core wasm into wasi:http component
+        run: |
+          wasm-tools component new \
+            samples/hello/target/wasm32-unknown-unknown/release/hello.wasm \
+            -o samples/hello/target/component.wasm
+
+      # Stage the wrapped component at the path `edge deploy` looks for
+      # by default (edge-cli/src/commands/deploy.rs:65: `target/wasm32-wasip2/release/<app>.wasm`).
+      # The CLI also accepts `--file` to override the path, but the
+      # default path means we don't need to plumb a flag through the
+      # composite action.
+      - name: Stage wrapped component
+        run: |
+          mkdir -p target/wasm32-wasip2/release
+          cp samples/hello/target/component.wasm target/wasm32-wasip2/release/hello.wasm
+
+      # Delegate install-cli + edge deploy + URL capture to the
+      # reusable composite action. We pass `build: 'false'` because
+      # the wasm build is handled above (the composite's default
+      # `cargo build --target wasm32-wasip2 --release` from cwd would
+      # try to build the entire host workspace for wasm and fail on
+      # tokio with full features, per PR #329).
+      #
+      # Fork PRs do not receive `secrets.EDGECLOUD_API_KEY` — the
+      # composite treats an empty API key as a no-op (writes empty
+      # `preview-url`), and the `Comment PR` step's `if:` skips on
+      # empty string. No secrets leak, no spurious failure.
+      - uses: ./.github/actions/deploy-preview
+        id: deploy
+        with:
+          api-key: ${{ secrets.EDGECLOUD_API_KEY }}
+          api-url: ${{ secrets.EDGECLOUD_API_URL }}
+          build: 'false'
+
+      - name: Comment PR
+        if: steps.deploy.outputs.preview-url != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🚀 Preview deployed at: ${{ steps.deploy.outputs.preview-url }}`
+            })

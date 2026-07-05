@@ -1,0 +1,14 @@
+# edgeCloud project config consumed by `edge deploy` / `edge build`.
+#
+# `[project].name` is the wasm app name; the CLI looks for
+# `target/wasm32-wasip2/release/<name>.wasm` by default, which the
+# preview CI populates by wrapping the `wasm32-unknown-unknown` build
+# with `wasm-tools component new`. See samples/hello/README.md.
+
+[project]
+name = "hello"
+
+[deployment]
+# Default API. Override with `EDGE_API_URL` env var or pass
+# `--api-url https://api.<region>.edgecloud.dev` to the CLI.
+api = "https://api.edgecloud.dev"
