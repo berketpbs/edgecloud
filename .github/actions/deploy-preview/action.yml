@@ -1,0 +1,43 @@
+name: 'edgeCloud Deploy Preview'
+description: 'Deploy a preview app to edgeCloud and comment the URL on the PR'
+inputs:
+  api-key:
+    description: 'edgeCloud API key'
+    required: true
+  api-url:
+    description: 'edgeCloud API URL'
+    required: false
+    default: 'https://api.edgecloud.dev'
+runs:
+  using: 'composite'
+  steps:
+    - name: Install edge CLI
+      shell: bash
+      run: |
+        curl -sSf https://raw.githubusercontent.com/edgeclouderz/edgecloud/main/scripts/install-cli.sh | bash
+
+    - name: Build wasm
+      shell: bash
+      run: |
+        rustup target add wasm32-wasip2
+        cargo build --target wasm32-wasip2 --release
+
+    - name: Deploy preview
+      id: deploy
+      shell: bash
+      run: |
+        EDGE_API_KEY=${{ inputs.api-key }} \
+        EDGE_API_URL=${{ inputs.api-url }} \
+        edge deploy --preview 2>&1 | tee /tmp/preview-output.txt
+        echo "preview-url=$(grep -oP 'https?://[^\s]+' /tmp/preview-output.txt | head -1)" >> $GITHUB_OUTPUT
+
+    - name: Comment PR
+      uses: actions/github-script@v7
+      with:
+        script: |
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `🚀 Preview deployed at: ${{ steps.deploy.outputs.preview-url }}`
+          })

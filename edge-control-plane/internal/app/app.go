@@ -43,6 +43,7 @@ type App struct {
 	ReconcileSvc *service.ReconcileService
 	LogGC        *service.LogGCService
 	WorkerGC     *service.WorkerGCService
+	DeploymentGC *service.DeploymentGCService
 	AutoscaleSvc *autoscale.Service
 }
 
@@ -448,6 +449,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		ReconcileSvc:    reconcileSvc,
 		LogGC:           service.NewLogGCService(logEntryRepo),
 		WorkerGC:        service.NewWorkerGCService(workerRepo),
+		DeploymentGC:    service.NewDeploymentGCService(deploymentRepo),
 		AutoscaleSvc:    autoscaleSvc,
 	}
 }
@@ -475,6 +477,12 @@ func (a *App) RunBackground(ctx context.Context) {
 	workerGCInterval := parseDurationEnv("WORKER_GC_INTERVAL", 5*time.Minute)
 	workerMaxAge := parseDurationEnv("WORKER_MAX_AGE", 15*time.Minute)
 	go a.WorkerGC.Run(ctx, workerGCInterval, workerMaxAge)
+
+	// Deployment GC. Deletes old deployments that are no longer active.
+	// Tunable via env (DEPLOY_GC_INTERVAL, DEPLOY_RETENTION).
+	deployGCInterval := parseDurationEnv("DEPLOY_GC_INTERVAL", 1*time.Hour)
+	deployRetention := parseDurationEnv("DEPLOY_RETENTION", 7*24*time.Hour)
+	go a.DeploymentGC.Run(ctx, deployGCInterval, deployRetention)
 
 	// Cluster autoscaler (issue #85). No-op when cfg.Autoscale.Enabled
 	// is false — Subscribe returns nil immediately.

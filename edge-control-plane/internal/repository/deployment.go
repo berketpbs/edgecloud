@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/jmoiron/sqlx"
@@ -90,4 +91,19 @@ func (r *DeploymentRepository) DeleteByApp(ctx context.Context, tenantID, appNam
 func (r *DeploymentRepository) DeleteByID(ctx context.Context, id string) error {
 	_, err := r.db.ExecContext(ctx, `DELETE FROM deployments WHERE id = $1`, id)
 	return err
+}
+
+// DeleteOlderThan deletes deployment rows older than the given retention
+// that are NOT currently active. Returns the number of rows deleted.
+func (r *DeploymentRepository) DeleteOlderThan(ctx context.Context, retention time.Duration) (int64, error) {
+	res, err := r.db.ExecContext(ctx,
+		`DELETE FROM deployments d
+		 WHERE d.created_at < NOW() - make_interval(secs => $1)
+		   AND NOT EXISTS (SELECT 1 FROM active_deployments ad WHERE ad.deployment_id = d.id)`,
+		int(retention.Seconds()),
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
