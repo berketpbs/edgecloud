@@ -235,6 +235,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/apps/{appName}/promote/{deploymentID}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Promote a preview deployment to production
+         * @description Activates a deployment under a different app name than it was
+         *     originally deployed under. Used to promote a preview deployment
+         *     (deployed under a suffixed name like `myapp--preview-abc123`) to
+         *     the real app name. The deployment must belong to the same tenant.
+         */
+        post: operations["promoteDeployment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/apps/{appName}/rollback": {
         parameters: {
             query?: never;
@@ -2136,6 +2159,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ActivateResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    promoteDeployment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Target app name for promotion. */
+                appName: string;
+                /** @description The deployment ID to promote (from a preview deploy). */
+                deploymentID: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deployment promoted. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @example promoted */
+                        status?: string;
+                    };
                 };
             };
             401: components["responses"]["Unauthorized"];
