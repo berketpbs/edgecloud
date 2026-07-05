@@ -110,17 +110,16 @@ func (m *mockQuotaRepo) AddRequestCount(ctx context.Context, tenantID string, de
 // (nil/empty) so tests that only exercise one method don't need to
 // stub the others.
 type mockTenantRepo struct {
-    tenantRepoInterface
+	tenantRepoInterface
 }
 
 func (m *mockTenantRepo) SetDisabledAt(_ context.Context, _ string, _ time.Time) error {
-    return nil
+	return nil
 }
 
 func (m *mockTenantRepo) ClearDisabledAt(_ context.Context, _ string) error {
-    return nil
+	return nil
 }
-
 
 type mockActiveRepo struct {
 	getFunc               func(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error)

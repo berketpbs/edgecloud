@@ -487,6 +487,7 @@ mod tests {
     fn forwarder() -> Arc<LogForwarder> {
         let signer = crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
+            None,
             "edgecloud",
             "w_test",
             "test-region",
@@ -588,6 +589,7 @@ mod tests {
 
         let signer = crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
+            None,
             "edgecloud",
             "w_test",
             "test-region",
@@ -615,6 +617,7 @@ mod tests {
 
         let signer = crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
+            None,
             "edgecloud",
             "w_test",
             "test-region",
@@ -644,6 +647,7 @@ mod tests {
 
         let signer = crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
+            None,
             "edgecloud",
             "w_test",
             "test-region",
@@ -673,6 +677,7 @@ mod tests {
 
         let signer = crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
+            None,
             "edgecloud",
             "w_test",
             "test-region",
@@ -753,6 +758,7 @@ mod tests {
 
         let signer = crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
+            None,
             "edgecloud",
             "w_test",
             "test-region",
@@ -804,6 +810,7 @@ mod tests {
 
         let signer = crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
+            None,
             "edgecloud",
             "w_test",
             "test-region",
@@ -834,6 +841,7 @@ mod tests {
 
         let signer = crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
+            None,
             "edgecloud",
             "w_test",
             "test-region",
@@ -871,6 +879,7 @@ mod tests {
 
         let signer = crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
+            None,
             "edgecloud",
             "w_test",
             "test-region",
@@ -908,6 +917,7 @@ mod tests {
 
         let signer = crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
+            None,
             "edgecloud",
             "w_test",
             "test-region",

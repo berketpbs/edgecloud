@@ -32,12 +32,11 @@ type App struct {
 	// Handler is the complete http.Handler with all middleware and routes applied.
 	Handler http.Handler
 
-	// Region, JWTSecret, JWTIssuer, and ArtifactPath are exposed so
-	// main.go can mint the ingress service token at startup.
-	Region       string
-	JWTSecret    string
-	JWTIssuer    string
-	ArtifactPath string
+	// Region, WorkerJWTConfig, and ArtifactPath are exposed so main.go
+	// can mint the ingress service token at startup.
+	Region          string
+	WorkerJWTConfig middleware.WorkerJWTConfig
+	ArtifactPath    string
 
 	// Background service references. RunBackground starts all three.
 	WorkerSvc    *service.WorkerService
@@ -419,8 +418,10 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	)(http.HandlerFunc(internalHandler.UpdateDomainStatus)))
 
 	workerJWTConfig := middleware.WorkerJWTConfig{
-		Secret: cfg.JWT.Secret,
-		Issuer: cfg.JWT.Issuer,
+		Secret:    cfg.JWT.Secret,
+		Issuer:    cfg.JWT.Issuer,
+		ActiveKID: cfg.JWT.ActiveKID,
+		Keys:      cfg.JWT.Keys,
 	}
 	// /api/internal/download is mounted under a separate middleware
 	// chain that accepts either a worker JWT OR an X-Internal-Token header.
@@ -437,16 +438,15 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	)
 
 	return &App{
-		Handler:      wrappedHandler,
-		Region:       cfg.Region,
-		JWTSecret:    cfg.JWT.Secret,
-		JWTIssuer:    cfg.JWT.Issuer,
-		ArtifactPath: cfg.Storage.ArtifactPath,
-		WorkerSvc:    workerSvc,
-		ReconcileSvc: reconcileSvc,
-		LogGC:        service.NewLogGCService(logEntryRepo),
-		WorkerGC:     service.NewWorkerGCService(workerRepo),
-		AutoscaleSvc: autoscaleSvc,
+		Handler:         wrappedHandler,
+		Region:          cfg.Region,
+		WorkerJWTConfig: workerJWTConfig,
+		ArtifactPath:    cfg.Storage.ArtifactPath,
+		WorkerSvc:       workerSvc,
+		ReconcileSvc:    reconcileSvc,
+		LogGC:           service.NewLogGCService(logEntryRepo),
+		WorkerGC:        service.NewWorkerGCService(workerRepo),
+		AutoscaleSvc:    autoscaleSvc,
 	}
 }
 
