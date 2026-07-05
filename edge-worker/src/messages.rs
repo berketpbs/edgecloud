@@ -165,6 +165,11 @@ pub struct AppStatus {
     /// the Prometheus endpoints.
     #[serde(default)]
     pub observer_metrics: Vec<MetricSample>,
+    /// If present, the port the guest is listening on for WebSocket
+    /// upgrade traffic (assigned via `EDGE_WS_PORT` env). The ingress
+    /// routes WebSocket connections to this port instead of `port`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_port: Option<u16>,
 }
 
 /// Kind of metric emitted via `edge:observe`.
@@ -308,6 +313,7 @@ mod tests {
             outbound_bytes: 0,
             tenant_id: "t_1".into(),
             port: 8080,
+            ws_port: None,
             observer_metrics: vec![
                 MetricSample {
                     name: "hits".into(),
@@ -370,6 +376,7 @@ mod tests {
             outbound_bytes: 512,
             tenant_id: "t_1".into(),
             port: 8080,
+            ws_port: None,
             observer_metrics: vec![],
         };
         let json = serde_json::to_string(&s).expect("serialize");

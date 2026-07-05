@@ -448,6 +448,7 @@ impl Supervisor {
             execution_model,
             dispatch,
             metrics_acc,
+            ws_port,
         }));
 
         self.state.write().await.apps.insert(
@@ -952,6 +953,7 @@ impl Supervisor {
                     observer_metrics: metrics,
                     tenant_id: inst.tenant_id.clone(),
                     port: inst.port,
+                    ws_port: inst.ws_port,
                 },
             );
         }

@@ -153,6 +153,26 @@ pub async fn apply_heartbeat(table: &RoutingTable, hb: &HeartbeatMessage) -> boo
             )
             .await;
         changed = true;
+
+        // If the heartbeat carries a WebSocket port, insert a second
+        // route entry so Caddy can route Upgrade: websocket requests
+        // to the correct upstream port (issue #312). Caddy's
+        // reverse_proxy natively handles WebSocket transparently.
+        if let Some(ws_port) = app.ws_port {
+            let ws_app_name = format!("{}-ws", app_name);
+            let ws_deployment_id = deployment_id.map(|d| format!("{}-ws", d));
+            table
+                .upsert(
+                    &app.tenant_id,
+                    &ws_app_name,
+                    ws_deployment_id.as_deref(),
+                    100,
+                    worker_addr,
+                    ws_port,
+                    &app.status,
+                )
+                .await;
+        }
     }
     changed
 }
@@ -229,6 +249,7 @@ mod tests {
             outbound_bytes: 0,
             tenant_id: tenant_id.to_string(),
             port,
+            ws_port: None,
             observer_metrics: vec![],
         }
     }
