@@ -760,10 +760,12 @@ mod tests {
         let serialized = component.serialize().unwrap();
         assert!(!serialized.is_empty());
 
-        let deserialized = unsafe {
-            wasmtime::component::Component::deserialize(&engine, &serialized).unwrap()
-        };
-        assert_eq!(component.serialize().unwrap(), deserialized.serialize().unwrap());
+        let deserialized =
+            unsafe { wasmtime::component::Component::deserialize(&engine, &serialized).unwrap() };
+        assert_eq!(
+            component.serialize().unwrap(),
+            deserialized.serialize().unwrap()
+        );
 
         // Verify that deserializing corrupted bytes returns an error
         let mut corrupted = serialized.clone();
@@ -772,9 +774,8 @@ mod tests {
         } else if !corrupted.is_empty() {
             corrupted[0] ^= 0xFF;
         }
-        let corrupt_result = unsafe {
-            wasmtime::component::Component::deserialize(&engine, &corrupted)
-        };
+        let corrupt_result =
+            unsafe { wasmtime::component::Component::deserialize(&engine, &corrupted) };
         assert!(corrupt_result.is_err());
     }
 }

@@ -28,10 +28,10 @@ type CreateAPIKeyRequest struct {
 }
 
 type CreateAPIKeyResponse struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Role      string `json:"role"`
-	Token     string `json:"token"` // Raw key shown only once
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Role  string `json:"role"`
+	Token string `json:"token"` // Raw key shown only once
 }
 
 func (h *APIKeyHandler) Create(w http.ResponseWriter, r *http.Request) {

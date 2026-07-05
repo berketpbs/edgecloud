@@ -208,7 +208,9 @@ impl Supervisor {
                 Ok(cwasm_bytes) => {
                     // Safety: Loading pre-compiled code from a local trusted file cache is safe.
                     // We catch any deserialization failures and fall back to from_binary.
-                    match unsafe { wasmtime::component::Component::deserialize(engine, &cwasm_bytes) } {
+                    match unsafe {
+                        wasmtime::component::Component::deserialize(engine, &cwasm_bytes)
+                    } {
                         Ok(c) => {
                             tracing::info!(
                                 tenant_id,
@@ -259,7 +261,9 @@ impl Supervisor {
                         tokio::spawn(async move {
                             match serialized_result {
                                 Ok(serialized_bytes) => {
-                                    if let Err(e) = tokio::fs::write(&cwasm_path_clone, &serialized_bytes).await {
+                                    if let Err(e) =
+                                        tokio::fs::write(&cwasm_path_clone, &serialized_bytes).await
+                                    {
                                         tracing::warn!(
                                             path = %cwasm_path_clone.display(),
                                             err = %e,
