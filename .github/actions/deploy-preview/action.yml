@@ -27,7 +27,17 @@ runs:
     - name: Install edge CLI
       shell: bash
       run: |
-        curl -sSf https://raw.githubusercontent.com/edgeclouderz/edgecloud/main/scripts/install-cli.sh | bash
+        # Build edge-cli from the workspace and install to $CARGO_HOME/bin
+        # (which is on PATH for subsequent steps in the same job).
+        #
+        # The previous version of this step ran
+        # `curl .../scripts/install-cli.sh | bash`, but that script
+        # does not exist on `main` (404'd in CI run 28745210914).
+        # Building from the workspace is safer than piping a remote
+        # shell script anyway — no supply-chain risk on every CI run.
+        # edge-cli's only workspace dep is `edge-config`, which cargo
+        # resolves from the workspace root.
+        cargo install --path ./edge-cli --locked --root "$CARGO_HOME"
 
     - name: Build wasm
       if: inputs.build == 'true'
