@@ -160,6 +160,7 @@ async fn build_supervisor_inner(config: &Config) -> anyhow::Result<Arc<Superviso
     let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
     let jwt_signer = WorkerJwtSigner::new(
         config.worker_jwt_secret.clone(),
+        config.worker_jwt_kid.clone(),
         config.worker_jwt_issuer.clone(),
         config.worker_id.clone(),
         config.region.clone(),

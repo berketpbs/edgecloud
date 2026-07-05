@@ -46,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
     // JWT carries the worker's tenant_id claim.
     let jwt_signer = WorkerJwtSigner::new(
         config.worker_jwt_secret.clone(),
+        config.worker_jwt_kid.clone(),
         config.worker_jwt_issuer.clone(),
         config.worker_id.clone(),
         config.region.clone(),

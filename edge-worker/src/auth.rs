@@ -53,8 +53,12 @@ pub struct WorkerClaims {
 /// token's expiry is more than `REFRESH_LEAD` away. The mutex is held only
 /// for the read/write of the (token, expires_at) tuple — JWT encoding
 /// (potentially expensive) happens outside the lock.
+///
+/// When `kid` is `Some(...)`, the JWT header includes a `kid` field so the
+/// control plane can select the correct verification key during rotation.
 pub struct WorkerJwtSigner {
     secret: Vec<u8>,
+    kid: Option<String>,
     issuer: String,
     worker_id: String,
     region: String,
@@ -73,6 +77,7 @@ struct CachedToken {
 impl WorkerJwtSigner {
     pub fn new(
         secret: impl Into<Vec<u8>>,
+        kid: Option<String>,
         issuer: impl Into<String>,
         worker_id: impl Into<String>,
         region: impl Into<String>,
@@ -80,6 +85,7 @@ impl WorkerJwtSigner {
     ) -> Arc<Self> {
         Arc::new(Self {
             secret: secret.into(),
+            kid,
             issuer: issuer.into(),
             worker_id: worker_id.into(),
             region: region.into(),
@@ -144,8 +150,13 @@ impl WorkerJwtSigner {
             apps: Vec::new(),
         };
 
+        let mut header = Header::new(jsonwebtoken::Algorithm::HS256);
+        if let Some(ref kid) = self.kid {
+            header.kid = Some(kid.clone());
+        }
+
         encode(
-            &Header::new(jsonwebtoken::Algorithm::HS256),
+            &header,
             &claims,
             &EncodingKey::from_secret(&self.secret),
         )
@@ -205,6 +216,7 @@ mod tests {
     fn signer() -> Arc<WorkerJwtSigner> {
         WorkerJwtSigner::new(
             "test-secret",
+            Some("test-kid".to_string()),
             "edgecloud",
             "w_fra_abc123",
             "fra",

@@ -73,6 +73,13 @@ pub struct Config {
     /// see follow-up issue D). NATS heartbeats and the deployment
     /// supervisor keep working regardless.
     pub worker_jwt_secret: String,
+    /// Optional `kid` header value for worker JWTs. Set to the matching
+    /// `active_kid` in the control plane's `jwt.keys` config. When set,
+    /// the JWT header includes a `kid` field so the CP can select the
+    /// correct verification key during rotation. The CP also falls back
+    /// to the legacy `jwt.secret` when `kid` is absent, so this is
+    /// optional. Override with `WORKER_JWT_KID`.
+    pub worker_jwt_kid: Option<String>,
     /// Expected `iss` claim. Must match `JWT_ISSUER` on the Go side.
     /// Defaults to `edgecloud`.
     pub worker_jwt_issuer: String,
@@ -209,6 +216,7 @@ impl Config {
             epoch_tick_ms: parse_env_u64("EPOCH_TICK_MS", 10)?,
             epoch_deadline_ticks: parse_env_u64("EPOCH_DEADLINE_TICKS", 100)?,
             worker_jwt_secret: std::env::var("WORKER_JWT_SECRET").unwrap_or_default(),
+            worker_jwt_kid: std::env::var("WORKER_JWT_KID").ok(),
             worker_jwt_issuer: std::env::var("WORKER_JWT_ISSUER")
                 .unwrap_or_else(|_| "edgecloud".into()),
             worker_tenant_id: std::env::var("WORKER_TENANT_ID").context(
