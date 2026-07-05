@@ -109,7 +109,7 @@ var (
 	// check is enough to reject obviously-non-wasm inputs before
 	// the bytes hit disk. Handler maps to HTTP 400.
 	ErrInvalidWasm = errors.New("invalid wasm artifact")
-	ErrNoLastGood                  = fmt.Errorf("no previous deployment to roll back to")
+	ErrNoLastGood  = fmt.Errorf("no previous deployment to roll back to")
 	// ErrNoActiveDeployment is returned by RollbackDeployment when there
 	// is no active-deployment row for this app (user never activated any
 	// deployment). Distinct from ErrAppNotFound (which is for the app
@@ -204,7 +204,7 @@ type DeploymentService struct {
 	artifactStore  storage.ArtifactStore
 	publisher      nats.Publisher
 	appSvc         *AppService
-	envSvc         *EnvService // injected for decryption at publish
+	envSvc         *EnvService     // injected for decryption at publish
 	webhookSvc     *WebhookService // injected for webhook events
 	// defaultRegion is this control plane's own region. Used as the
 	// fallback `regions` list for deployments that don't explicitly
@@ -341,15 +341,15 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 	}
 
 	deployment := &domain.Deployment{
-		ID:        "d_" + uuid.New().String(),
-		TenantID:  tenantID,
-		AppName:   appName,
-		Status:    domain.StatusDeployed,
+		ID:       "d_" + uuid.New().String(),
+		TenantID: tenantID,
+		AppName:  appName,
+		Status:   domain.StatusDeployed,
 		// Hash is populated after SaveAndHash returns the SHA-256
 		// of the streamed bytes. Streaming keeps the bytes from
 		// ever sitting in RAM as a single buffer.
-		Hash:    "",
-		Regions: domain.StringArrayFrom(effectiveRegions),
+		Hash:      "",
+		Regions:   domain.StringArrayFrom(effectiveRegions),
 		CreatedAt: time.Now(),
 		// Persist the tenant opt-in on the artifact row so audit
 		// endpoints (`edge deployments --app foo`) can show which
@@ -358,7 +358,7 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		AutoRollbackEnabled: autoRollback,
 	}
 
-// Wrap the row insert and the artifact save in a transaction
+	// Wrap the row insert and the artifact save in a transaction
 	// so a failed SaveAndHash rolls the deployment row back
 	// atomically (we don't end up with a row pointing at no
 	// artifact). The artifact store is filesystem, so the tx only

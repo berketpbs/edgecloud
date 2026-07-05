@@ -418,7 +418,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	)(http.HandlerFunc(internalHandler.UpdateDomainStatus)))
 
 	workerJWTConfig := middleware.WorkerJWTConfig{
-		Secret: cfg.JWT.Secret,
+		Secret:    cfg.JWT.Secret,
 		Issuer:    cfg.JWT.Issuer,
 		ActiveKID: cfg.JWT.ActiveKID,
 		Keys:      cfg.JWT.Keys,

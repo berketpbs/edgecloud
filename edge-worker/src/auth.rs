@@ -155,12 +155,8 @@ impl WorkerJwtSigner {
             header.kid = Some(kid.clone());
         }
 
-        encode(
-            &header,
-            &claims,
-            &EncodingKey::from_secret(&self.secret),
-        )
-        .expect("HS256 signing should not fail")
+        encode(&header, &claims, &EncodingKey::from_secret(&self.secret))
+            .expect("HS256 signing should not fail")
     }
 }
 

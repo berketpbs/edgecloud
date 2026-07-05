@@ -16,11 +16,11 @@ import (
 //
 // A background goroutine evicts stale entries every 10 minutes.
 type TenantCreationLimiter struct {
-	mu       sync.Mutex
-	entries  map[string][]time.Time // IP → creation timestamps
-	max      int                    // max creations per window
-	window   time.Duration         // sliding window
-	stopCh   chan struct{}
+	mu      sync.Mutex
+	entries map[string][]time.Time // IP → creation timestamps
+	max     int                    // max creations per window
+	window  time.Duration          // sliding window
+	stopCh  chan struct{}
 }
 
 // NewTenantCreationLimiter creates a limiter allowing up to `max`
