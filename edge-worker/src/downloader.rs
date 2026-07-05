@@ -60,11 +60,13 @@ impl Downloader {
                             "cached artifact failed verification; invalidating and re-downloading"
                         );
                         let _ = tokio::fs::remove_file(&cache_path).await;
+                        let _ = tokio::fs::remove_file(self.cwasm_path(deployment_id)).await;
                     }
                 },
                 Err(e) => {
                     tracing::warn!(deployment_id, err = %e, "cache read failed; downloading");
                     let _ = tokio::fs::remove_file(&cache_path).await;
+                    let _ = tokio::fs::remove_file(self.cwasm_path(deployment_id)).await;
                 }
             }
         }
@@ -102,8 +104,12 @@ impl Downloader {
         Ok(data)
     }
 
-    fn cache_path(&self, deployment_id: &str) -> PathBuf {
+    pub fn cache_path(&self, deployment_id: &str) -> PathBuf {
         self.cache_dir.join(format!("{}.wasm", deployment_id))
+    }
+
+    pub fn cwasm_path(&self, deployment_id: &str) -> PathBuf {
+        self.cache_dir.join(format!("{}.cwasm", deployment_id))
     }
 
     /// Notify the control plane that the worker has exhausted the
@@ -742,5 +748,34 @@ mod tests {
             "test",
             "t_test",
         )
+    }
+
+    #[test]
+    fn test_cwasm_serialization_deserialization() {
+        let engine = wasmtime::Engine::default();
+        // Minimal binary representation of a WebAssembly component
+        let wasm_bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00];
+
+        let component = wasmtime::component::Component::from_binary(&engine, &wasm_bytes).unwrap();
+        let serialized = component.serialize().unwrap();
+        assert!(!serialized.is_empty());
+
+        let deserialized =
+            unsafe { wasmtime::component::Component::deserialize(&engine, &serialized).unwrap() };
+        assert_eq!(
+            component.serialize().unwrap(),
+            deserialized.serialize().unwrap()
+        );
+
+        // Verify that deserializing corrupted bytes returns an error
+        let mut corrupted = serialized.clone();
+        if corrupted.len() >= 4 {
+            corrupted[0..4].copy_from_slice(&[0, 0, 0, 0]); // overwrite magic header
+        } else if !corrupted.is_empty() {
+            corrupted[0] ^= 0xFF;
+        }
+        let corrupt_result =
+            unsafe { wasmtime::component::Component::deserialize(&engine, &corrupted) };
+        assert!(corrupt_result.is_err());
     }
 }

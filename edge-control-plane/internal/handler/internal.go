@@ -82,7 +82,7 @@ type InternalHandler struct {
 type autoRollbacker interface {
 	RollbackDeployment(ctx context.Context, tenantID, appName string) (string, error)
 	GetDeployment(ctx context.Context, tenantID, deploymentID string) (*domain.Deployment, error)
-	GetArtifact(ctx context.Context, tenantID, appName, deploymentID string) (io.ReadCloser, error)
+	GetArtifact(ctx context.Context, tenantID, appName, deploymentID string, format string) (io.ReadCloser, error)
 }
 
 // workerRegisterer is the narrow contract the RegisterWorker endpoint
@@ -155,7 +155,8 @@ func (h *InternalHandler) Download(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	artifact, err := h.deploymentSvc.GetArtifact(r.Context(), deployment.TenantID, deployment.AppName, deployment.ID)
+	format := r.URL.Query().Get("format")
+	artifact, err := h.deploymentSvc.GetArtifact(r.Context(), deployment.TenantID, deployment.AppName, deployment.ID, format)
 	if err != nil {
 		if errors.Is(err, storage.ErrArtifactTooLarge) {
 			httperror.PayloadTooLargeCtx(w, r, "artifact exceeds maximum size")

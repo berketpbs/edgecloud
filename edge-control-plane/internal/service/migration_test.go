@@ -118,6 +118,18 @@ func (m *mockArtifactStore) Open(ctx context.Context, tenantID, appName, deploym
 	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
+func (m *mockArtifactStore) OpenFormat(ctx context.Context, tenantID, appName, deploymentID, format string) (io.ReadCloser, error) {
+	if format == "" || format == "wasm" {
+		return m.Open(ctx, tenantID, appName, deploymentID)
+	}
+	key := tenantID + "/" + appName + "/" + deploymentID + "." + format
+	data, ok := m.artifacts[key]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
 func (m *mockArtifactStore) Delete(ctx context.Context, tenantID, appName, deploymentID string) error {
 	key := tenantID + "/" + appName + "/" + deploymentID
 	m.deleteCalls = append(m.deleteCalls, key)

@@ -46,7 +46,7 @@ func (s *stubAutoRollbacker) GetDeployment(_ context.Context, _, _ string) (*dom
 	panic("stubAutoRollbacker.GetDeployment called from AutoRollback test — wrong code path exercised")
 }
 
-func (s *stubAutoRollbacker) GetArtifact(_ context.Context, _, _, _ string) (io.ReadCloser, error) {
+func (s *stubAutoRollbacker) GetArtifact(_ context.Context, _, _, _, _ string) (io.ReadCloser, error) {
 	panic("stubAutoRollbacker.GetArtifact called from AutoRollback test — wrong code path exercised")
 }
 

@@ -37,6 +37,7 @@ type ArtifactStore interface {
 	// (commit 0e08a32) and Deploy (commit 26578b2) to avoid buffering
 	// a 100 MiB artifact in RAM.
 	SaveAndHash(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) ([]byte, error)
+	OpenFormat(ctx context.Context, tenantID, appName, deploymentID, format string) (io.ReadCloser, error)
 }
 
 // FSArtifactStore is the filesystem-backed implementation of
@@ -249,4 +250,43 @@ func (s *FSArtifactStore) Delete(ctx context.Context, tenantID, appName, deploym
 		return err
 	}
 	return nil
+}
+
+// OpenFormat reads a Wasm or serialized native code artifact (.cwasm) from disk.
+func (s *FSArtifactStore) OpenFormat(ctx context.Context, tenantID, appName, deploymentID, format string) (io.ReadCloser, error) {
+	if format == "" || format == "wasm" {
+		return s.Open(ctx, tenantID, appName, deploymentID)
+	}
+	if format != "cwasm" {
+		return nil, fmt.Errorf("unsupported format %q", format)
+	}
+
+	if err := validatePathComponent("tenantID", tenantID); err != nil {
+		return nil, err
+	}
+	if err := validatePathComponent("appName", appName); err != nil {
+		return nil, err
+	}
+	if err := validatePathComponent("deploymentID", deploymentID); err != nil {
+		return nil, err
+	}
+
+	path := filepath.Join(s.basePath, tenantID, appName, deploymentID+".cwasm")
+	clean := filepath.Clean(path)
+	if !strings.HasPrefix(clean, filepath.Clean(s.basePath)) {
+		return nil, fmt.Errorf("path traversal detected")
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() > MaxArtifactSize {
+		return nil, fmt.Errorf("%w: file is %d bytes", ErrArtifactTooLarge, info.Size())
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	return newLimitReadCloser(f, MaxArtifactSize), nil
 }
