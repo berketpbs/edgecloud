@@ -20,20 +20,21 @@ import (
 // only the CreateAPIKey method is exercised. Other methods panic so we notice
 // if the handler starts using them.
 type mockAPIKeyCreateSvc struct {
-	createCalls []createCall
+	createCalls []callCreate
 	createResp  *domain.APIKey
 	createRaw   string
 	createErr   error
 }
 
-type createCall struct {
+type callCreate struct {
 	tenantID string
 	name     string
 	role     string
+	ttlHours *int
 }
 
-func (m *mockAPIKeyCreateSvc) CreateAPIKey(_ context.Context, tenantID, name, role string) (*domain.APIKey, string, error) {
-	m.createCalls = append(m.createCalls, createCall{tenantID, name, role})
+func (m *mockAPIKeyCreateSvc) CreateAPIKey(_ context.Context, tenantID, name, role string, ttlHours *int) (*domain.APIKey, string, error) {
+	m.createCalls = append(m.createCalls, callCreate{tenantID, name, role, ttlHours})
 	if m.createErr != nil {
 		return nil, "", m.createErr
 	}
@@ -46,10 +47,13 @@ func (m *mockAPIKeyCreateSvc) ListAPIKeys(_ context.Context, _ string) ([]domain
 func (m *mockAPIKeyCreateSvc) GetByID(_ context.Context, _ string) (*domain.APIKey, error) {
 	panic("not used by Create")
 }
-func (m *mockAPIKeyCreateSvc) DeleteAPIKey(_ context.Context, _ string) error {
+func (m *mockAPIKeyCreateSvc) DeleteAPIKey(_ context.Context, _, _ string) error {
 	panic("not used by Create")
 }
 func (m *mockAPIKeyCreateSvc) UpdateAPIKey(_ context.Context, _, _ string, _ *domain.UpdateAPIKeyRequest) (*domain.APIKey, error) {
+	panic("not used by Create")
+}
+func (m *mockAPIKeyCreateSvc) RotateAPIKey(_ context.Context, _, _ string) (*domain.APIKey, string, error) {
 	panic("not used by Create")
 }
 
@@ -179,7 +183,7 @@ type mockAPIKeyUpdateSvc struct {
 	updateErr error
 }
 
-func (m *mockAPIKeyUpdateSvc) CreateAPIKey(_ context.Context, _, _, _ string) (*domain.APIKey, string, error) {
+func (m *mockAPIKeyUpdateSvc) CreateAPIKey(_ context.Context, _, _, _ string, _ *int) (*domain.APIKey, string, error) {
 	panic("not used by Update")
 }
 func (m *mockAPIKeyUpdateSvc) ListAPIKeys(_ context.Context, _ string) ([]domain.APIKey, error) {
@@ -188,11 +192,14 @@ func (m *mockAPIKeyUpdateSvc) ListAPIKeys(_ context.Context, _ string) ([]domain
 func (m *mockAPIKeyUpdateSvc) GetByID(_ context.Context, _ string) (*domain.APIKey, error) {
 	panic("not used by Update")
 }
-func (m *mockAPIKeyUpdateSvc) DeleteAPIKey(_ context.Context, _ string) error {
+func (m *mockAPIKeyUpdateSvc) DeleteAPIKey(_ context.Context, _, _ string) error {
 	panic("not used by Update")
 }
 func (m *mockAPIKeyUpdateSvc) UpdateAPIKey(_ context.Context, _, _ string, _ *domain.UpdateAPIKeyRequest) (*domain.APIKey, error) {
 	return m.updateKey, m.updateErr
+}
+func (m *mockAPIKeyUpdateSvc) RotateAPIKey(_ context.Context, _, _ string) (*domain.APIKey, string, error) {
+	panic("not used by Update")
 }
 
 func TestUpdateAPIKey_Success(t *testing.T) {
@@ -212,7 +219,7 @@ func TestUpdateAPIKey_Success(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d (body: %s)", rr.Code, rr.Body.String())
 	}
-	var key domain.APIKey
+	var key domain.SafeAPIKeyResponse
 	if err := json.NewDecoder(rr.Body).Decode(&key); err != nil {
 		t.Fatalf("decode: %v", err)
 	}

@@ -2152,6 +2152,31 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /api/v1/keys/{keyID}/rotate:
+    post:
+      operationId: rotateAPIKey
+      summary: Rotate an API key (generate new key, expire old one)
+      parameters:
+        - name: keyID
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The API key ID to rotate.
+      responses:
+        '201':
+          description: New API key created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateAPIKeyResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   # -------------------------------------------------------------------------
   # Egress allowlist
   # -------------------------------------------------------------------------
