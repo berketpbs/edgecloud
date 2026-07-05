@@ -76,6 +76,9 @@ pub struct AppInstance {
     /// on the wire. `None` before the app is running (the accumulator
     /// is created in `run_app_loop` / `start_app`).
     pub metrics_acc: Option<Arc<MetricsAccumulator>>,
+    /// If EDGE_WS_PORT was requested, holds the allocated port number.
+    /// Reported in heartbeats so the ingress can route WS traffic.
+    pub ws_port: Option<u16>,
 }
 
 /// Shared worker state — protected by a tokio RwLock.
