@@ -30,7 +30,9 @@ func (h *SecretsAdminHandler) ListKeys(w http.ResponseWriter, r *http.Request) {
 		"encryption_enabled": h.encryptor != nil,
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("secrets ListKeys encode: %v", err)
+	}
 }
 
 // ReEncrypt decrypts every env value and re-encrypts with the active key.
@@ -53,5 +55,7 @@ func (h *SecretsAdminHandler) ReEncrypt(w http.ResponseWriter, r *http.Request) 
 		"status":       "ok",
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("secrets ReEncrypt encode: %v", err)
+	}
 }
