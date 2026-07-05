@@ -199,15 +199,96 @@ impl Supervisor {
             }
         };
 
-        // Compile the component using the shared engine.
         let engine = &self.state.read().await.engine;
-        let component = match wasmtime::component::Component::from_binary(engine, &artifact) {
-            Ok(c) => c,
-            Err(e) => {
-                let mut pool = self.port_pool.lock().await;
-                pool.release(raw_port);
-                return Err(anyhow::Error::from(e)
-                    .context(format!("failed to compile component for {}", app_name)));
+
+        // Try AOT compilation cache first.
+        let cwasm_path = self.downloader.cwasm_path(&spec.deployment_id);
+        let component = if cwasm_path.exists() {
+            match tokio::fs::read(&cwasm_path).await {
+                Ok(cwasm_bytes) => {
+                    // Safety: Loading pre-compiled code from a local trusted file cache is safe.
+                    // We catch any deserialization failures and fall back to from_binary.
+                    match unsafe { wasmtime::component::Component::deserialize(engine, &cwasm_bytes) } {
+                        Ok(c) => {
+                            tracing::info!(
+                                tenant_id,
+                                app_name,
+                                deployment_id = %spec.deployment_id,
+                                "AOT pre-compilation cache hit: successfully deserialized component"
+                            );
+                            Some(c)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                tenant_id,
+                                app_name,
+                                deployment_id = %spec.deployment_id,
+                                err = %e,
+                                "failed to deserialize component; falling back to JIT compilation"
+                            );
+                            let _ = tokio::fs::remove_file(&cwasm_path).await;
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        tenant_id,
+                        app_name,
+                        deployment_id = %spec.deployment_id,
+                        err = %e,
+                        "failed to read AOT cache file; falling back to JIT compilation"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let component = match component {
+            Some(c) => c,
+            None => {
+                // Compile the component using the shared engine.
+                match wasmtime::component::Component::from_binary(engine, &artifact) {
+                    Ok(c) => {
+                        // Serialize and write to cache in a background task so we don't block
+                        // the initial start/restart path.
+                        let cwasm_path_clone = cwasm_path.clone();
+                        let serialized_result = c.serialize();
+                        tokio::spawn(async move {
+                            match serialized_result {
+                                Ok(serialized_bytes) => {
+                                    if let Err(e) = tokio::fs::write(&cwasm_path_clone, &serialized_bytes).await {
+                                        tracing::warn!(
+                                            path = %cwasm_path_clone.display(),
+                                            err = %e,
+                                            "failed to write serialized component to AOT cache"
+                                        );
+                                    } else {
+                                        tracing::info!(
+                                            path = %cwasm_path_clone.display(),
+                                            "successfully wrote serialized component to AOT cache"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(err = %e, "failed to serialize compiled component");
+                                }
+                            }
+                        });
+                        c
+                    }
+                    Err(e) => {
+                        let mut pool = self.port_pool.lock().await;
+                        pool.release(raw_port);
+                        if let Some(ws) = ws_port {
+                            pool.release(ws);
+                        }
+                        return Err(anyhow::Error::from(e)
+                            .context(format!("failed to compile component for {}", app_name)));
+                    }
+                }
             }
         };
 

@@ -191,6 +191,87 @@ func (s *RemoteArtifactStore) Open(ctx context.Context, tenantID, appName, deplo
 	return newLimitReadCloser(f, MaxArtifactSize), nil
 }
 
+func (s *RemoteArtifactStore) OpenFormat(ctx context.Context, tenantID, appName, deploymentID, format string) (io.ReadCloser, error) {
+	if format == "" || format == "wasm" {
+		return s.Open(ctx, tenantID, appName, deploymentID)
+	}
+	if format != "cwasm" {
+		return nil, fmt.Errorf("unsupported format %q", format)
+	}
+
+	// Lane 1: local cache lookup.
+	rc, err := s.cache.OpenFormat(ctx, tenantID, appName, deploymentID, "cwasm")
+	if err == nil {
+		return rc, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("RemoteArtifactStore.OpenFormat: cache lookup: %w", err)
+	}
+
+	// Lane 2: peer pull-through.
+	peerURL := s.peerURL + "/api/internal/download/" + deploymentID + "?format=cwasm"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, peerURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("RemoteArtifactStore.OpenFormat: building request: %w", err)
+	}
+	req.Header.Set("X-Internal-Token", s.peerToken)
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("RemoteArtifactStore.OpenFormat: GET %s: %w", peerURL, err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("OpenFormat pull: failed to close response body: %v", err)
+		}
+	}()
+
+	if resp.StatusCode == http.StatusNotFound {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return nil, &fs.PathError{Op: "open", Path: deploymentID + ".cwasm", Err: os.ErrNotExist}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("RemoteArtifactStore.OpenFormat: status %d", resp.StatusCode)
+	}
+
+	cwasmPath, err := s.cache.Path(tenantID, appName, deploymentID)
+	if err != nil {
+		return nil, err
+	}
+	cwasmPath = strings.TrimSuffix(cwasmPath, ".wasm") + ".cwasm"
+
+	tmp := fmt.Sprintf("%s.tmp.%d", cwasmPath, os.Getpid())
+	f, err := os.Create(tmp)
+	if err != nil {
+		return nil, err
+	}
+	cleanup := func() { _ = os.Remove(tmp) }
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		_ = f.Close()
+		cleanup()
+		return nil, err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		cleanup()
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
+		cleanup()
+		return nil, err
+	}
+	if err := os.Rename(tmp, cwasmPath); err != nil {
+		cleanup()
+		return nil, err
+	}
+
+	finalFile, err := os.Open(cwasmPath)
+	if err != nil {
+		return nil, err
+	}
+	return newLimitReadCloser(finalFile, MaxArtifactSize), nil
+}
+
 // Delete removes the local cache entry only. Cross-CP GC is a
 // separate concern.
 func (s *RemoteArtifactStore) Delete(ctx context.Context, tenantID, appName, deploymentID string) error {

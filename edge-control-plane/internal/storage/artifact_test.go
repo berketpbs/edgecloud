@@ -352,3 +352,65 @@ func (e *errAfter) Read(p []byte) (int, error) {
 	e.off += n
 	return n, nil
 }
+
+func TestFSArtifactStore_OpenFormat(t *testing.T) {
+	dir := t.TempDir()
+	s := NewFSArtifactStore(dir)
+
+	// Save a .wasm artifact
+	payload := []byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00}
+	if err := s.Save(context.Background(), "t_1", "hello", "d_1", bytes.NewReader(payload)); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// 1. Open with default format (empty string)
+	rc, err := s.OpenFormat(context.Background(), "t_1", "hello", "d_1", "")
+	if err != nil {
+		t.Fatalf("OpenFormat empty: %v", err)
+	}
+	got, _ := io.ReadAll(rc)
+	rc.Close()
+	if !bytes.Equal(got, payload) {
+		t.Errorf("expected %x, got %x", payload, got)
+	}
+
+	// 2. Open with "wasm" format
+	rc, err = s.OpenFormat(context.Background(), "t_1", "hello", "d_1", "wasm")
+	if err != nil {
+		t.Fatalf("OpenFormat wasm: %v", err)
+	}
+	got, _ = io.ReadAll(rc)
+	rc.Close()
+	if !bytes.Equal(got, payload) {
+		t.Errorf("expected %x, got %x", payload, got)
+	}
+
+	// 3. Open with "cwasm" format (should fail since it's missing)
+	_, err = s.OpenFormat(context.Background(), "t_1", "hello", "d_1", "cwasm")
+	if err == nil || !os.IsNotExist(err) {
+		t.Fatalf("expected os.ErrNotExist, got %v", err)
+	}
+
+	// Write a mock .cwasm file manually to test OpenFormat("cwasm")
+	cwasmPath := filepath.Join(dir, "t_1", "hello", "d_1.cwasm")
+	cwasmPayload := []byte("cwasm native code")
+	if err := os.WriteFile(cwasmPath, cwasmPayload, 0644); err != nil {
+		t.Fatalf("writing mock cwasm: %v", err)
+	}
+
+	rc, err = s.OpenFormat(context.Background(), "t_1", "hello", "d_1", "cwasm")
+	if err != nil {
+		t.Fatalf("OpenFormat cwasm: %v", err)
+	}
+	got, _ = io.ReadAll(rc)
+	rc.Close()
+	if !bytes.Equal(got, cwasmPayload) {
+		t.Errorf("expected %s, got %s", cwasmPayload, got)
+	}
+
+	// 4. Open with unsupported format
+	_, err = s.OpenFormat(context.Background(), "t_1", "hello", "d_1", "invalid")
+	if err == nil || !strings.Contains(err.Error(), "unsupported format") {
+		t.Fatalf("expected unsupported format error, got %v", err)
+	}
+}

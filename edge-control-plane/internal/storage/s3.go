@@ -159,6 +159,49 @@ func (s *S3ArtifactStore) Open(ctx context.Context, tenantID, appName, deploymen
 	return newLimitReadCloser(resp.Body, MaxArtifactSize), nil
 }
 
+func (s *S3ArtifactStore) OpenFormat(ctx context.Context, tenantID, appName, deploymentID, format string) (io.ReadCloser, error) {
+	if format == "" || format == "wasm" {
+		return s.Open(ctx, tenantID, appName, deploymentID)
+	}
+	if format != "cwasm" {
+		return nil, fmt.Errorf("unsupported format %q", format)
+	}
+
+	if err := validatePathComponent("tenantID", tenantID); err != nil {
+		return nil, fmt.Errorf("invalid artifact key: %w", err)
+	}
+	if err := validatePathComponent("appName", appName); err != nil {
+		return nil, fmt.Errorf("invalid artifact key: %w", err)
+	}
+	if err := validatePathComponent("deploymentID", deploymentID); err != nil {
+		return nil, fmt.Errorf("invalid artifact key: %w", err)
+	}
+	key := s.keyPrefix + tenantID + "/" + appName + "/" + deploymentID + ".cwasm"
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.objectURL(key), nil)
+	if err != nil {
+		return nil, fmt.Errorf("S3ArtifactStore.OpenFormat: building request: %w", err)
+	}
+	signRequest(req, s.accessKey, s.secretKey, s.region, nil, "UNSIGNED-PAYLOAD")
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("S3ArtifactStore.OpenFormat: GET %s: %w", key, err)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			log.Printf("S3.OpenFormat: failed to close response body: %v", closeErr)
+		}
+		return nil, &fs.PathError{Op: "open", Path: key, Err: os.ErrNotExist}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			log.Printf("S3.OpenFormat: failed to close response body: %v", closeErr)
+		}
+		return nil, fmt.Errorf("S3ArtifactStore.OpenFormat: GET %s: status %d", key, resp.StatusCode)
+	}
+	return newLimitReadCloser(resp.Body, MaxArtifactSize), nil
+}
+
 // SaveAndHash streams the artifact to S3 while computing its
 // SHA-256 in the same io.MultiWriter pass. The streaming benefit
 // (no intermediate buffer) is preserved: the read fills the

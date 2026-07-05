@@ -1063,7 +1063,7 @@ func (s *DeploymentService) GetActiveDeployment(ctx context.Context, tenantID, a
 	return s.deploymentRepo.GetByID(ctx, ad.DeploymentID)
 }
 
-func (s *DeploymentService) GetArtifact(ctx context.Context, tenantID, appName, deploymentID string) (io.ReadCloser, error) {
+func (s *DeploymentService) GetArtifact(ctx context.Context, tenantID, appName, deploymentID string, format string) (io.ReadCloser, error) {
 	// Verify deployment belongs to this tenant
 	deployment, err := s.deploymentRepo.GetByID(ctx, deploymentID)
 	if err != nil || deployment == nil {
@@ -1072,5 +1072,5 @@ func (s *DeploymentService) GetArtifact(ctx context.Context, tenantID, appName, 
 	if deployment.TenantID != tenantID || deployment.AppName != appName {
 		return nil, fmt.Errorf("deployment not found")
 	}
-	return s.artifactStore.Open(ctx, tenantID, appName, deploymentID)
+	return s.artifactStore.OpenFormat(ctx, tenantID, appName, deploymentID, format)
 }
