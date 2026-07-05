@@ -542,10 +542,17 @@ impl HandlerDispatch {
         let app_name_for_log = self.config.app_ctx.app_name.clone();
         let proxy_pre = self.proxy_pre.clone();
 
-        // Inline guest dispatch. `instantiate_async` + `call_handle`
-        // run sequentially on this future; the guest returns by
-        // calling `set` (drops `sender`), which fires `receiver`.
-        let dispatch_outcome: anyhow::Result<()> = async {
+        // Spawn the guest concurrently so the host can start serving
+        // the response body as soon as the guest calls
+        // ResponseOutparam::set, while the guest continues writing
+        // body chunks. This enables SSE, long-polling, and progressive
+        // chunked responses — the guest delivers headers immediately
+        // and streams the body over time.
+        //
+        // `HyperOutgoingBody` uses an internal mpsc channel so it does
+        // not borrow `store`; the response can outlive the `tokio::spawn`
+        // future without dangling references.
+        let guest_result = tokio::spawn(async move {
             let proxy = proxy_pre
                 .instantiate_async(&mut store)
                 .await
@@ -555,8 +562,7 @@ impl HandlerDispatch {
                 .call_handle(store, req_handle, out)
                 .await
                 .map_err(|e| anyhow::anyhow!("proxy.wasi_http_incoming_handler.call_handle: {e}"))
-        }
-        .await;
+        });
 
         let meter = &self.config.meter;
         match receiver.await {
@@ -614,15 +620,16 @@ impl HandlerDispatch {
                     return Ok(synthetic_500("guest cleanly exited", meter));
                 }
 
-                // Real trap. `dispatch_outcome` has already resolved
-                // (above) with the underlying error; surface it as a
-                // synthetic 500 so hyper sends a real response to the
-                // client instead of closing the connection mid-message.
-                let e = match dispatch_outcome {
-                    Ok(()) => {
+                // Real trap. guest_result has already resolved with
+                // the underlying error; surface it as a synthetic 500
+                // so hyper sends a real response to the client instead
+                // of closing the connection mid-message.
+                let e = match guest_result.await {
+                    Ok(Ok(())) => {
                         anyhow::anyhow!("guest never invoked `response-outparam::set` method")
                     }
-                    Err(e) => e,
+                    Ok(Err(e)) => e,
+                    Err(join_err) => anyhow::anyhow!("guest task panicked: {join_err}"),
                 };
                 tracing::warn!(
                     tenant_id = %tenant_for_log,
